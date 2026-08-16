@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Fast Tap</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: white;
+      margin: 0;
+      height: 100vh;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 20px;
+      overflow: hidden;
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+    .info {
+      font-size: 17px;
+      margin-bottom: 28px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+    #score {
+      font-size: 64px;
+      font-weight: bold;
+      color: #38bdf8;
+      margin: 16px 0;
+      min-height: 76px;
+    }
+    #timer {
+      font-size: 22px;
+      margin-bottom: 28px;
+      color: #e2e8f0;
+    }
+    #tapBtn {
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      background: linear-gradient(145deg, #3b82f6, #1d4ed8);
+      border: none;
+      color: white;
+      font-size: 28px;
+      font-weight: bold;
+      box-shadow: 0 10px 25px rgba(59, 130, 246, 0.4);
+      cursor: pointer;
+      transition: transform 0.08s, box-shadow 0.08s;
+      touch-action: manipulation;
+    }
+    #tapBtn:active:not(:disabled) {
+      transform: scale(0.92);
+      box-shadow: 0 5px 15px rgba(59, 130, 246, 0.3);
+    }
+    #tapBtn:disabled {
+      background: #475569;
+      box-shadow: none;
+      cursor: not-allowed;
+      opacity: 0.85;
+    }
+    .btn-row {
+      margin-top: 28px;
+      display: flex;
+      gap: 12px;
+    }
+    .small-btn {
+      background: #1e293b;
+      color: white;
+      border: 1px solid #334155;
+      padding: 12px 24px;
+      border-radius: 12px;
+      font-size: 16px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .small-btn:active {
+      background: #334155;
+    }
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <h1>⚡ Fast Tap</h1>
+  <div class="info" id="userInfo">در حال آماده‌سازی...</div>
+
+  <div id="score">۰</div>
+  <div id="timer">زمان: ۱۰</div>
+
+  <button id="tapBtn">شروع</button>
+
+  <div class="btn-row hidden" id="endBtns">
+    <button class="small-btn" id="restartBtn">بازی دوباره</button>
+  </div>
+
+  <script>
+    // ========== ابزارهای کمکی ==========
+    function toPersianDigits(num) {
+      return String(num).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
+    }
+
+    // چک ایمن وجود Telegram WebApp
+    const hasTelegram = !!(window.Telegram && window.Telegram.WebApp);
+    const tg = hasTelegram ? window.Telegram.WebApp : null;
+
+    // فراخوانی ایمن متدهای تلگرام
+    function safeTg(method, ...args) {
+      if (!tg) return null;
+      try {
+        if (typeof tg[method] === 'function') {
+          return tg[method](...args);
+        }
+      } catch (e) {
+        console.warn(`Telegram method ${method} failed:`, e);
+      }
+      return null;
+    }
+
+    function safeHaptic(type, style) {
+      if (!tg || !tg.HapticFeedback) return;
+      try {
+        if (type === 'impact' && tg.HapticFeedback.impactOccurred) {
+          tg.HapticFeedback.impactOccurred(style || 'light');
+        } else if (type === 'notification' && tg.HapticFeedback.notificationOccurred) {
+          tg.HapticFeedback.notificationOccurred(style || 'success');
+        }
+      } catch (e) {}
+    }
+
+    function safeShowAlert(message) {
+      if (tg && typeof tg.showAlert === 'function') {
+        try {
+          tg.showAlert(message);
+          return;
+        } catch (e) {}
+      }
+      // fallback برای مرورگر
+      alert(message);
+    }
+
+    // ========== مقداردهی اولیه تلگرام ==========
+    if (tg) {
+      try {
+        tg.ready();
+        tg.expand();
+        if (typeof tg.setHeaderColor === 'function') tg.setHeaderColor('#0f172a');
+        if (typeof tg.setBackgroundColor === 'function') tg.setBackgroundColor('#0f172a');
+      } catch (e) {
+        console.warn('Telegram init error:', e);
+      }
+    }
+
+    // ========== عناصر DOM ==========
+    const userInfo = document.getElementById('userInfo');
+    const scoreEl = document.getElementById('score');
+    const timerEl = document.getElementById('timer');
+    const tapBtn = document.getElementById('tapBtn');
+    const endBtns = document.getElementById('endBtns');
+    const restartBtn = document.getElementById('restartBtn');
+
+    // نمایش اطلاعات کاربر
+    if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+      const u = tg.initDataUnsafe.user;
+      userInfo.textContent = `سلام ${u.first_name || 'بازیکن'} 👋`;
+    } else if (hasTelegram) {
+      userInfo.textContent = 'سلام بازیکن 👋';
+    } else {
+      userInfo.textContent = 'حالت تست مرورگر (بدون تلگرام)';
+    }
+
+    // ========== وضعیت بازی ==========
+    let score = 0;
+    let timeLeft = 10;
+    let isPlaying = false;
+    let timerInterval = null;
+    let gameEnded = false; // جلوگیری از امتیاز اضافه در لحظه پایان
+
+    function clearTimer() {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    }
+
+    function startGame() {
+      clearTimer();
+      gameEnded = false;
+      score = 0;
+      timeLeft = 10;
+      isPlaying = true;
+
+      scoreEl.textContent = toPersianDigits(score);
+      timerEl.textContent = `زمان: ${toPersianDigits(timeLeft)}`;
+      tapBtn.textContent = 'بزن!';
+      tapBtn.disabled = false;
+      endBtns.classList.add('hidden');
+
+      // مخفی کردن MainButton
+      if (tg && tg.MainButton) {
+        try { tg.MainButton.hide(); } catch (e) {}
+      }
+
+      safeHaptic('impact', 'medium');
+
+      timerInterval = setInterval(() => {
+        timeLeft--;
+        timerEl.textContent = `زمان: ${toPersianDigits(timeLeft)}`;
+
+        if (timeLeft <= 0) {
+          endGame();
+        }
+      }, 1000);
+    }
+
+    function endGame() {
+      if (gameEnded) return; // جلوگیری از اجرای دوبل
+      gameEnded = true;
+      isPlaying = false;
+      clearTimer();
+
+      tapBtn.disabled = true;
+      tapBtn.textContent = 'تمام!';
+      endBtns.classList.remove('hidden');
+
+      // نمایش MainButton تلگرام
+      if (tg && tg.MainButton) {
+        try {
+          tg.MainButton.setText('بازی دوباره');
+          tg.MainButton.show();
+        } catch (e) {}
+      }
+
+      safeShowAlert(`آفرین!\nامتیاز تو: ${toPersianDigits(score)}`);
+      safeHaptic('notification', 'success');
+    }
+
+    // ========== رویدادها ==========
+    tapBtn.addEventListener('click', () => {
+      if (!isPlaying) {
+        startGame();
+        return;
+      }
+
+      // جلوگیری از امتیاز در لحظه پایان
+      if (gameEnded || timeLeft <= 0) return;
+
+      score++;
+      scoreEl.textContent = toPersianDigits(score);
+      safeHaptic('impact', 'light');
+    });
+
+    restartBtn.addEventListener('click', () => {
+      startGame();
+    });
+
+    // MainButton تلگرام
+    if (tg && tg.MainButton && typeof tg.MainButton.onClick === 'function') {
+      try {
+        tg.MainButton.onClick(() => {
+          startGame();
+        });
+      } catch (e) {}
+    }
+
+    // پاک‌سازی در صورت ترک صفحه
+    window.addEventListener('beforeunload', clearTimer);
+    window.addEventListener('pagehide', clearTimer);
+
+    // پشتیبانی از visibilitychange (وقتی اپ به پس‌زمینه می‌رود)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        // می‌توان تایمر را متوقف کرد، اما فعلاً فقط پاک‌سازی امن نگه می‌داریم
+      }
+    });
+  </script>
+</body>
+</html>
