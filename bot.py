@@ -12,17 +12,15 @@ from telegram.ext import (
 # ===== تنظیمات - توکن از Environment Variable خونده میشه =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# آیدی عددی کاربرهایی که از قبل اجازه استفاده دارن (فقط برای اولین بار)
-# توی Render، Environment Variable به اسم ALLOWED_USER_IDS بساز، آیدی‌ها با کاما جدا
+# آیدی عددی کاربرهایی که از قبل اجازه استفاده دارن (فقط برای اولین بار / seed)
 ALLOWED_USER_IDS = {
     int(uid.strip())
     for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")
     if uid.strip().isdigit()
 }
 
-# آیدی عددی ادمین‌ها (کسایی که به بخش مدیریت دسترسی دارن)
-# توی Render، Environment Variable به اسم ADMIN_IDS بساز، آیدی‌ها با کاما جدا
-ADMIN_IDS = {
+# آیدی عددی ادمین‌ها (فقط برای اولین بار / seed - بعدش از فایل خونده میشه)
+ADMIN_IDS_SEED = {
     int(uid.strip())
     for uid in os.environ.get("ADMIN_IDS", "").split(",")
     if uid.strip().isdigit()
@@ -30,7 +28,7 @@ ADMIN_IDS = {
 # ================================================================
 
 USERS_FILE = "users_data.json"
-USER_LIST_PAGE_SIZE = 6
+LIST_PAGE_SIZE = 6
 
 
 def load_users():
@@ -51,38 +49,45 @@ def save_users(users):
         print(f"⚠️ ذخیره فایل کاربران با خطا مواجه شد: {e}")
 
 
-# لیست کاربرها که با /start شناخته میشن: {user_id_str: {first_name, username, allowed}}
+# {user_id_str: {first_name, username, allowed, is_admin}}
 USERS = load_users()
 
 
 def register_user(user):
     uid = str(user.id)
-    is_new = uid not in USERS
-    default_allowed = user.id in ADMIN_IDS or user.id in ALLOWED_USER_IDS
-    if is_new:
+    if uid not in USERS:
         USERS[uid] = {
             "first_name": user.first_name or "",
             "username": user.username or "",
-            "allowed": default_allowed,
+            "allowed": user.id in ADMIN_IDS_SEED or user.id in ALLOWED_USER_IDS,
+            "is_admin": user.id in ADMIN_IDS_SEED,
         }
     else:
         USERS[uid]["first_name"] = user.first_name or ""
         USERS[uid]["username"] = user.username or ""
+        USERS[uid].setdefault("is_admin", user.id in ADMIN_IDS_SEED)
     save_users(USERS)
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    info = USERS.get(str(user_id))
+    if info is not None:
+        return bool(info.get("is_admin", False))
+    return user_id in ADMIN_IDS_SEED
+
+
+def get_admin_ids():
+    ids = {int(uid) for uid, info in USERS.items() if info.get("is_admin")}
+    ids |= ADMIN_IDS_SEED
+    return ids
 
 
 def is_allowed(user_id: int) -> bool:
-    # ادمین‌ها همیشه اجازه دارن
     if is_admin(user_id):
         return True
     info = USERS.get(str(user_id))
     if info is not None:
         return bool(info.get("allowed", False))
-    # کاربری که هنوز ثبت نشده (استارت نزده)؛ برای سازگاری با تنظیمات قبلی
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
@@ -127,18 +132,25 @@ def main_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
+def user_display_name(user):
+    if user.username:
+        return f"{user.first_name or ''} (@{user.username})".strip()
+    return user.first_name or str(user.id)
+
+
 # ==================== بخش ادمین ====================
 
 def admin_menu():
     keyboard = [
         [InlineKeyboardButton("📋 لیست کاربران", callback_data="admin_list_0")],
         [InlineKeyboardButton("🔍 جستجوی آیدی", callback_data="admin_search")],
+        [InlineKeyboardButton("👑 مدیریت ادمین‌ها", callback_data="admin_admins_0")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_user_list_keyboard(ids, page=0):
-    per_page = USER_LIST_PAGE_SIZE
+def build_user_list_keyboard(ids, page, callback_prefix="admin_user_", list_callback_prefix="admin_list_"):
+    per_page = LIST_PAGE_SIZE
     total_pages = max(1, (len(ids) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     start = page * per_page
@@ -150,13 +162,39 @@ def build_user_list_keyboard(ids, page=0):
         status = "✅" if info.get("allowed") else "⛔"
         name = info.get("first_name") or ""
         label = f"{status} {uid}" + (f" - {name}" if name else "")
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_user_{uid}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"{callback_prefix}{uid}")])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin_list_{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"{list_callback_prefix}{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"admin_list_{page + 1}"))
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"{list_callback_prefix}{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")])
+    return InlineKeyboardMarkup(keyboard), total_pages, page
+
+
+def build_admin_list_keyboard(ids, page):
+    per_page = LIST_PAGE_SIZE
+    total_pages = max(1, (len(ids) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = ids[start:start + per_page]
+
+    keyboard = []
+    for uid in chunk:
+        info = USERS.get(uid, {})
+        name = info.get("first_name") or ""
+        label = f"👑 {uid}" + (f" - {name}" if name else "")
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_admin_detail_{uid}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin_admins_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"admin_admins_{page + 1}"))
     if nav:
         keyboard.append(nav)
 
@@ -185,6 +223,17 @@ def user_detail_text(uid):
         f"نام: {name}\n"
         f"یوزرنیم: @{username}\n"
         f"وضعیت فعلی: {status}"
+    )
+
+
+def admin_detail_text(uid):
+    info = USERS.get(uid, {})
+    name = info.get("first_name") or "-"
+    username = info.get("username") or "-"
+    return (
+        f"👑 آیدی: <code>{uid}</code>\n"
+        f"نام: {name}\n"
+        f"یوزرنیم: @{username}"
     )
 
 
@@ -258,6 +307,54 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    if data.startswith("admin_admins_"):
+        page = int(data.split("_")[-1])
+        ids = [uid for uid, info in USERS.items() if info.get("is_admin")]
+        if not ids:
+            await query.edit_message_text(
+                "هیچ ادمینی ثبت نشده.",
+                reply_markup=admin_menu()
+            )
+            return
+        keyboard, total_pages, page = build_admin_list_keyboard(ids, page)
+        await query.edit_message_text(
+            f"لیست ادمین‌ها (صفحه {page + 1} از {total_pages}):",
+            reply_markup=keyboard
+        )
+        return
+
+    if data.startswith("admin_admin_detail_"):
+        uid = data[len("admin_admin_detail_"):]
+        keyboard = []
+        if uid != str(user_id):
+            keyboard.append([InlineKeyboardButton("❌ حذف از ادمین", callback_data=f"admin_demote_{uid}")])
+        else:
+            keyboard.append([InlineKeyboardButton("این شما هستید", callback_data="admin_noop")])
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست ادمین‌ها", callback_data="admin_admins_0")])
+        await query.edit_message_text(
+            admin_detail_text(uid),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data.startswith("admin_demote_"):
+        uid = data[len("admin_demote_"):]
+        if uid == str(user_id):
+            await query.answer("⛔ نمی‌تونی خودت رو حذف کنی.", show_alert=True)
+            return
+        if uid in USERS:
+            USERS[uid]["is_admin"] = False
+            save_users(USERS)
+        await query.edit_message_text(
+            "✅ کاربر از لیست ادمین‌ها حذف شد.",
+            reply_markup=admin_menu()
+        )
+        return
+
+    if data == "admin_noop":
+        return
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # فقط برای جستجوی آیدی توسط ادمین استفاده میشه
@@ -281,6 +378,78 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
 
+# ==================== درخواست اجازه‌ی کاربر ====================
+
+async def handle_request_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    uid = str(user.id)
+
+    if is_allowed(user.id):
+        await query.answer("شما همین الان هم اجازه دارید ✅", show_alert=True)
+        return
+
+    await query.answer("درخواست شما برای ادمین ارسال شد ✅", show_alert=True)
+
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        return
+
+    name = user_display_name(user)
+    text = (
+        f"این {name} درخواست استفاده از بات شما را دارد.\n"
+        f"لطفا یکی از گزینه‌های زیر را انتخاب کنید:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ اجازه دادند", callback_data=f"reqallow_{uid}"),
+            InlineKeyboardButton("⛔ اجازه ندادند", callback_data=f"reqdeny_{uid}"),
+        ]
+    ])
+
+    for admin_id in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard)
+        except Exception as e:
+            print(f"⚠️ ارسال درخواست به ادمین {admin_id} با خطا مواجه شد: {e}")
+
+
+async def handle_request_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    query = update.callback_query
+    admin_user_id = update.effective_user.id
+
+    if not is_admin(admin_user_id):
+        await query.answer("⛔ شما به این بخش دسترسی ندارید.", show_alert=True)
+        return
+
+    await query.answer()
+
+    allow = data.startswith("reqallow_")
+    uid = data.split("_", 1)[-1]
+
+    if uid in USERS:
+        USERS[uid]["allowed"] = allow
+        save_users(USERS)
+
+    info = USERS.get(uid, {})
+    name = info.get("first_name") or uid
+    decision_text = "✅ شما اجازه دادید." if allow else "⛔ شما اجازه ندادید."
+    await query.edit_message_text(f"درخواست {name} بررسی شد.\n{decision_text}")
+
+    try:
+        if allow:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text="✅ به شما اجازه‌ی استفاده از ربات داده شد. برای شروع /start رو بزن."
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text="⛔ درخواست شما برای استفاده از ربات رد شد."
+            )
+    except Exception as e:
+        print(f"⚠️ اطلاع‌رسانی به کاربر {uid} با خطا مواجه شد: {e}")
+
 # ==================== پایان بخش ادمین ====================
 
 
@@ -289,8 +458,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user)
 
     if not is_allowed(user.id):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📩 درخواست اجازه استفاده", callback_data="request_access")]
+        ])
         await update.message.reply_text(
-            "⛔ شما اجازه استفاده از این ربات رو ندارید."
+            "⛔ شما اجازه استفاده از این ربات رو ندارید.",
+            reply_markup=keyboard
         )
         return
 
@@ -312,6 +485,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("admin_"):
         await admin_callback_handler(update, context, data)
+        return
+
+    if data == "request_access":
+        await handle_request_access(update, context)
+        return
+
+    if data.startswith("reqallow_") or data.startswith("reqdeny_"):
+        await handle_request_decision(update, context, data)
         return
 
     user_id = update.effective_user.id
