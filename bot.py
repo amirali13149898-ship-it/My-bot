@@ -1,7 +1,11 @@
 import os
+import io
+import re
 import json
+import zipfile
 import threading
 import requests
+from PIL import Image
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -190,8 +194,72 @@ def main_menu():
     keyboard = [
         [InlineKeyboardButton("📷 آپلود کاور", callback_data="mode_cover")],
         [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
+        [InlineKeyboardButton("📦 زیپ عکس‌ها به PDF", callback_data="mode_zip")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff")
+
+
+def _natural_sort_key(name):
+    # مرتب‌سازی طبیعی: img2 قبل از img10 بیاد، نه بعدش
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", name)]
+
+
+class ZipContainsNonImageError(Exception):
+    """وقتی فایلی غیر از عکس داخل زیپ پیدا بشه این خطا داده میشه."""
+    pass
+
+
+def convert_zip_images_to_pdf(zip_bytes):
+    """
+    عکس‌های داخل یه فایل زیپ رو می‌خونه، به ترتیب اسم مرتب می‌کنه و
+    همه رو توی یه PDF چندصفحه‌ای می‌چسبونه.
+
+    اگه حتی یه فایل غیرعکس (هر فرمتی جز IMAGE_EXTENSIONS) توی زیپ باشه،
+    ZipContainsNonImageError میده و کل عملیات متوقف میشه.
+    اگه زیپ خراب باشه یا هیچ فایلی توش نباشه None برمی‌گردونه.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            entries = [
+                n for n in zf.namelist()
+                if not n.endswith("/")  # پوشه‌ها رو رد کن
+                and not os.path.basename(n).startswith(".")  # فایل‌های مخفی/سیستمی رو رد کن
+                and os.path.basename(n) != ""
+            ]
+
+            if not entries:
+                return None
+
+            # اول چک کن که همه‌ی فایل‌ها عکس باشن - اگه حتی یکی غیرعکس بود
+            # کل عملیات متوقف میشه (قبل از اینکه هیچ عکسی پردازش بشه)
+            for name in entries:
+                if not name.lower().endswith(IMAGE_EXTENSIONS):
+                    raise ZipContainsNonImageError(name)
+
+            entries.sort(key=_natural_sort_key)
+
+            images = []
+            for name in entries:
+                with zf.open(name) as f:
+                    img = Image.open(io.BytesIO(f.read()))
+                    img.load()
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    images.append(img)
+    except zipfile.BadZipFile:
+        return None
+
+    if not images:
+        return None
+
+    output = io.BytesIO()
+    first, rest = images[0], images[1:]
+    first.save(output, format="PDF", save_all=True, append_images=rest)
+    return output.getvalue()
 
 
 def user_display_name(user):
@@ -577,6 +645,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "حالت «آپلود PDF» فعال شد ✅\nفقط فایل PDF بفرست (هر فایل دیگه‌ای رد میشه).",
             reply_markup=main_menu()
         )
+    elif data == "mode_zip":
+        context.user_data["mode"] = "zip_to_pdf"
+        await query.edit_message_text(
+            "حالت «زیپ عکس‌ها به PDF» فعال شد ✅\n"
+            "یه فایل ZIP بفرست که توش عکس باشه؛ عکس‌ها به ترتیب اسمشون "
+            "توی یه PDF چندصفحه‌ای چسبونده میشن.",
+            reply_markup=main_menu()
+        )
 
 
 async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE):
@@ -642,6 +718,49 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await msg.reply_text("⚠️ تو حالت «آپلود PDF» فقط فایل PDF قبول میشه. فایل دیگه‌ای نفرست.")
             return
+
+    elif mode == "zip_to_pdf":
+        # فقط ZIP قبول میشه
+        is_zip = (
+            msg.document
+            and (
+                msg.document.mime_type in ("application/zip", "application/x-zip-compressed")
+                or (msg.document.file_name and msg.document.file_name.lower().endswith(".zip"))
+            )
+        )
+        if not is_zip:
+            await msg.reply_text("⚠️ تو حالت «زیپ به PDF» فقط فایل ZIP قبول میشه. فایل دیگه‌ای نفرست.")
+            return
+
+        status = await msg.reply_text("در حال استخراج عکس‌ها و ساخت PDF...")
+        try:
+            zip_file_obj = await msg.document.get_file()
+            zip_bytes = await zip_file_obj.download_as_bytearray()
+            pdf_bytes = convert_zip_images_to_pdf(bytes(zip_bytes))
+        except ZipContainsNonImageError:
+            await status.edit_text("⚠️ باید در فایل شما فقط عکس باشد.")
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
+        except Exception as e:
+            await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
+
+        if pdf_bytes is None:
+            await status.edit_text(
+                "❌ هیچ عکسی توی فایل زیپ پیدا نشد یا فایل زیپ خراب بود."
+            )
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
+
+        await status.delete()
+        base_name = os.path.splitext(msg.document.file_name or "converted")[0]
+        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context)
+        return
+
     else:
         return
 
