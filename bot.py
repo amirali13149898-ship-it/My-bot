@@ -30,8 +30,38 @@ ADMIN_IDS_SEED = {
 USERS_FILE = "users_data.json"
 LIST_PAGE_SIZE = 6
 
+# ===== ذخیره‌سازی دائمی با Supabase =====
+# روی پلن رایگان Render دیسک موقتیه و هر ری‌استارت/دیپلوی فایل رو پاک
+# می‌کنه. برای همین اگه این دو متغیر ست شده باشن، به‌جای فایل روی دیسک،
+# از جدول bot_kv توی Supabase (رایگان و دائمی) استفاده می‌کنیم.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+SUPABASE_ROW_KEY = "users_data"
+
 
 def load_users():
+    if USE_SUPABASE:
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/bot_kv",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+                params={"key": f"eq.{SUPABASE_ROW_KEY}", "select": "value"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            rows = r.json()
+            if rows:
+                return rows[0].get("value") or {}
+            return {}
+        except Exception as e:
+            print(f"⚠️ خواندن از Supabase با خطا مواجه شد: {e}")
+            return {}
+
+    # حالت پشتیبان: فایل محلی (روی رندر رایگان دائمی نیست!)
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -42,6 +72,27 @@ def load_users():
 
 
 def save_users(users):
+    if USE_SUPABASE:
+        try:
+            r = requests.post(
+                f"{SUPABASE_URL}/rest/v1/bot_kv",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    # merge-duplicates یعنی اگه ردیف با همین key وجود داشت
+                    # آپدیت بشه (upsert) نه اینکه خطای تکراری بده
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                json=[{"key": SUPABASE_ROW_KEY, "value": users}],
+                timeout=15,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"⚠️ ذخیره در Supabase با خطا مواجه شد: {e}")
+        return
+
+    # حالت پشتیبان: فایل محلی (روی رندر رایگان دائمی نیست!)
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
@@ -55,24 +106,35 @@ USERS = load_users()
 
 def register_user(user):
     uid = str(user.id)
+    seed_admin = user.id in ADMIN_IDS_SEED
     if uid not in USERS:
         USERS[uid] = {
             "first_name": user.first_name or "",
             "username": user.username or "",
-            "allowed": user.id in ADMIN_IDS_SEED or user.id in ALLOWED_USER_IDS,
-            "is_admin": user.id in ADMIN_IDS_SEED,
+            "allowed": seed_admin or user.id in ALLOWED_USER_IDS,
+            "is_admin": seed_admin,
         }
     else:
         USERS[uid]["first_name"] = user.first_name or ""
         USERS[uid]["username"] = user.username or ""
-        USERS[uid].setdefault("is_admin", user.id in ADMIN_IDS_SEED)
+        # FIX: قبلاً از setdefault استفاده می‌شد که فقط وقتی کلید وجود نداشت
+        # مقدار می‌ذاشت. در نتیجه اگه کاربر قبل از اضافه شدن به ADMIN_IDS
+        # یه بار /start زده بود، is_admin برای همیشه false می‌موند حتی
+        # بعد از اضافه کردن آیدیش به Environment Variable.
+        # حالا هر بار چک می‌کنیم: یا از قبل توی فایل ادمین بوده، یا الان
+        # جزو ADMIN_IDS_SEED هست.
+        USERS[uid]["is_admin"] = bool(USERS[uid].get("is_admin", False)) or seed_admin
+        if seed_admin:
+            # اگه از طریق Environment Variable ادمینه، مطمئن شو اجازه‌ی
+            # استفاده هم داره.
+            USERS[uid]["allowed"] = True
     save_users(USERS)
 
 
 def is_admin(user_id: int) -> bool:
     info = USERS.get(str(user_id))
     if info is not None:
-        return bool(info.get("is_admin", False))
+        return bool(info.get("is_admin", False)) or user_id in ADMIN_IDS_SEED
     return user_id in ADMIN_IDS_SEED
 
 
@@ -604,6 +666,12 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
+
+    if USE_SUPABASE:
+        print("✅ ذخیره‌سازی: Supabase (دائمی)")
+    else:
+        print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
+              "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
 
     threading.Thread(target=run_web, daemon=True).start()
 
