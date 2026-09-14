@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 
 # ===== تنظیمات - این سه تا رو با مقادیر خودت جایگزین کن =====
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY"
 IA_ACCESS_KEY = "YOUR_ARCHIVE_ACCESS_KEY"
 IA_SECRET_KEY = "YOUR_ARCHIVE_SECRET_KEY"
 # ============================================================
