@@ -1,24 +1,15 @@
 import requests
-import re
-import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler, filters,
     CommandHandler, CallbackQueryHandler
 )
 
-# ===== تنظیمات - این سه تا رو با مقادیر خودت جایگزین کن =====
-BOT_TOKEN = "بعدا میزارم"
-IA_ACCESS_KEY = "YOUR_ARCHIVE_ACCESS_KEY"
-IA_SECRET_KEY = "YOUR_ARCHIVE_SECRET_KEY"
-# ============================================================
+# ===== تنظیمات - توکن ربات رو اینجا بذار =====
+BOT_TOKEN = "8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY"
+# ==============================================
 
 CATBOX_API = "https://catbox.moe/user/api.php"
-
-
-def make_identifier(filename: str) -> str:
-    base = re.sub(r'[^a-zA-Z0-9._-]', '-', filename)
-    return f"{base}-{int(time.time())}"
 
 
 def upload_catbox(filename, file_bytes):
@@ -31,24 +22,6 @@ def upload_catbox(filename, file_bytes):
         )
         if r.status_code == 200 and r.text.startswith("http"):
             return r.text.strip()
-    except Exception:
-        pass
-    return None
-
-
-def upload_archive(filename, file_bytes):
-    try:
-        identifier = make_identifier(filename)
-        upload_url = f"https://s3.us.archive.org/{identifier}/{filename}"
-        headers = {
-            "authorization": f"LOW {IA_ACCESS_KEY}:{IA_SECRET_KEY}",
-            "x-archive-meta01-collection": "opensource",
-            "x-archive-meta-mediatype": "texts",
-            "x-archive-auto-make-bucket": "1",
-        }
-        r = requests.put(upload_url, headers=headers, data=bytes(file_bytes), timeout=120)
-        if r.status_code in (200, 201):
-            return f"https://archive.org/download/{identifier}/{filename}"
     except Exception:
         pass
     return None
@@ -88,23 +61,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def process_and_reply(msg, filename, file_bytes, context):
+async def process_and_reply(msg, filename, file_bytes):
     status = await msg.reply_text("در حال آپلود...")
 
     link = upload_catbox(filename, file_bytes)
-    source = "Catbox"
-    if not link:
-        link = upload_archive(filename, file_bytes)
-        source = "Archive.org"
 
     if link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
         await status.edit_text(
-            f"✅ آپلود شد ({source})\nلینک مستقیم:\n<code>{link}</code>",
+            f"✅ آپلود شد (Catbox)\nلینک مستقیم:\n<code>{link}</code>",
             parse_mode="HTML"
         )
     else:
-        await status.edit_text("❌ آپلود ناموفق بود، هر دو سرویس جواب ندادن.")
+        await status.edit_text("❌ آپلود ناموفق بود، Catbox جواب نداد.")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,7 +115,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_bytes = await file_obj.download_as_bytearray()
-    await process_and_reply(msg, filename, file_bytes, context)
+    await process_and_reply(msg, filename, file_bytes)
 
 
 def main():
