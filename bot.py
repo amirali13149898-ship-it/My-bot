@@ -78,7 +78,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def process_and_reply(msg, filename, file_bytes):
+async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text("در حال آپلود...")
 
     link = upload_catbox(filename, file_bytes)
@@ -91,6 +91,13 @@ async def process_and_reply(msg, filename, file_bytes):
         )
     else:
         await status.edit_text("❌ آپلود ناموفق بود، Catbox جواب نداد.")
+
+    # ریست کردن حالت و نمایش دوباره‌ی منو بعد از هر آپلود
+    context.user_data["mode"] = None
+    await msg.reply_text(
+        "یکی از حالت‌ها رو انتخاب کن:",
+        reply_markup=main_menu()
+    )
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,8 +138,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    file_bytes = await file_obj.download_as_bytearray()
-    await process_and_reply(msg, filename, file_bytes)
+    try:
+        file_bytes = await file_obj.download_as_bytearray()
+        await process_and_reply(msg, filename, file_bytes, context)
+    except Exception as e:
+        # هر خطایی که پیش بیاد، ربات کرش نمی‌کنه و به کاربر اطلاع میده
+        await msg.reply_text(f"❌ خطایی پیش اومد: {e}")
+        context.user_data["mode"] = None
+        await msg.reply_text(
+            "یکی از حالت‌ها رو انتخاب کن:",
+            reply_markup=main_menu()
+        )
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    # لاگ کردن خطا بدون کرش کردن ربات - برای اینکه سرویس رایگان هیچ‌وقت متوقف نشه
+    print(f"⚠️ خطا رخ داد: {context.error}")
 
 
 def main():
@@ -145,6 +166,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_error_handler(error_handler)
     app.run_polling()
 
 
