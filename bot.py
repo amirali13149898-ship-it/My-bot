@@ -1,3 +1,4 @@
+import os
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -5,9 +6,9 @@ from telegram.ext import (
     CommandHandler, CallbackQueryHandler
 )
 
-# ===== تنظیمات - توکن ربات رو اینجا بذار =====
-BOT_TOKEN = "8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY"
-# ==============================================
+# ===== تنظیمات - توکن از Environment Variable خونده میشه =====
+BOT_TOKEN = os.environ.get("8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY")
+# ================================================================
 
 CATBOX_API = "https://catbox.moe/user/api.php"
 
@@ -119,6 +120,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
