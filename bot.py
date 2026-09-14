@@ -1,5 +1,7 @@
 import os
+import threading
 import requests
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler, filters,
@@ -8,6 +10,20 @@ from telegram.ext import (
 
 # ===== تنظیمات - توکن از Environment Variable خونده میشه =====
 BOT_TOKEN = os.environ.get("8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY")
+# ================================================================
+
+# ===== وب‌سرور کوچیک برای زنده نگه‌داشتن سرویس روی Render =====
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "Bot is running."
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
 # ================================================================
 
 CATBOX_API = "https://catbox.moe/user/api.php"
@@ -122,6 +138,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
+
+    threading.Thread(target=run_web, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
