@@ -9,7 +9,7 @@ from telegram.ext import (
 )
 
 # ===== تنظیمات - توکن از Environment Variable خونده میشه =====
-BOT_TOKEN = os.environ.get("8696746090:AAE6EfoCvc85vYsLPZCFXzzs8zlPJ27sZNY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # ================================================================
 
 # ===== وب‌سرور کوچیک برای زنده نگه‌داشتن سرویس روی Render =====
