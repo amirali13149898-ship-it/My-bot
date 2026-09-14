@@ -55,35 +55,24 @@ USERS = load_users()
 
 def register_user(user):
     uid = str(user.id)
-    seed_admin = user.id in ADMIN_IDS_SEED
     if uid not in USERS:
         USERS[uid] = {
             "first_name": user.first_name or "",
             "username": user.username or "",
-            "allowed": seed_admin or user.id in ALLOWED_USER_IDS,
-            "is_admin": seed_admin,
+            "allowed": user.id in ADMIN_IDS_SEED or user.id in ALLOWED_USER_IDS,
+            "is_admin": user.id in ADMIN_IDS_SEED,
         }
     else:
         USERS[uid]["first_name"] = user.first_name or ""
         USERS[uid]["username"] = user.username or ""
-        # FIX: قبلاً از setdefault استفاده می‌شد که فقط وقتی کلید وجود نداشت
-        # مقدار می‌ذاشت. در نتیجه اگه کاربر قبل از اضافه شدن به ADMIN_IDS
-        # یه بار /start زده بود، is_admin برای همیشه false می‌موند حتی
-        # بعد از اضافه کردن آیدیش به Environment Variable.
-        # حالا هر بار چک می‌کنیم: یا از قبل توی فایل ادمین بوده، یا الان
-        # جزو ADMIN_IDS_SEED هست.
-        USERS[uid]["is_admin"] = bool(USERS[uid].get("is_admin", False)) or seed_admin
-        if seed_admin:
-            # اگه از طریق Environment Variable ادمینه، مطمئن شو اجازه‌ی
-            # استفاده هم داره.
-            USERS[uid]["allowed"] = True
+        USERS[uid].setdefault("is_admin", user.id in ADMIN_IDS_SEED)
     save_users(USERS)
 
 
 def is_admin(user_id: int) -> bool:
     info = USERS.get(str(user_id))
     if info is not None:
-        return bool(info.get("is_admin", False)) or user_id in ADMIN_IDS_SEED
+        return bool(info.get("is_admin", False))
     return user_id in ADMIN_IDS_SEED
 
 
