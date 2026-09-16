@@ -121,16 +121,8 @@ def register_user(user):
     else:
         USERS[uid]["first_name"] = user.first_name or ""
         USERS[uid]["username"] = user.username or ""
-        # FIX: قبلاً از setdefault استفاده می‌شد که فقط وقتی کلید وجود نداشت
-        # مقدار می‌ذاشت. در نتیجه اگه کاربر قبل از اضافه شدن به ADMIN_IDS
-        # یه بار /start زده بود، is_admin برای همیشه false می‌موند حتی
-        # بعد از اضافه کردن آیدیش به Environment Variable.
-        # حالا هر بار چک می‌کنیم: یا از قبل توی فایل ادمین بوده، یا الان
-        # جزو ADMIN_IDS_SEED هست.
         USERS[uid]["is_admin"] = bool(USERS[uid].get("is_admin", False)) or seed_admin
         if seed_admin:
-            # اگه از طریق Environment Variable ادمینه، مطمئن شو اجازه‌ی
-            # استفاده هم داره.
             USERS[uid]["allowed"] = True
     save_users(USERS)
 
@@ -195,6 +187,7 @@ def main_menu():
         [InlineKeyboardButton("📷 آپلود کاور", callback_data="mode_cover")],
         [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
         [InlineKeyboardButton("📦 زیپ عکس‌ها به PDF", callback_data="mode_zip")],
+        [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -211,6 +204,32 @@ def _natural_sort_key(name):
 class ZipContainsNonImageError(Exception):
     """وقتی فایلی غیر از عکس داخل زیپ پیدا بشه این خطا داده میشه."""
     pass
+
+
+def images_bytes_to_pdf(entries):
+    """
+    entries: لیستی از (filename, raw_bytes) که از قبل به ترتیب دلخواه
+    مرتب شده. عکس‌های معتبر رو می‌خونه و توی یه PDF چندصفحه‌ای می‌چسبونه.
+    اگه هیچ عکس معتبری توی entries نباشه، None برمی‌گردونه.
+    """
+    images = []
+    for _name, raw in entries:
+        try:
+            img = Image.open(io.BytesIO(raw))
+            img.load()
+        except Exception:
+            continue
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        images.append(img)
+
+    if not images:
+        return None
+
+    output = io.BytesIO()
+    first, rest = images[0], images[1:]
+    first.save(output, format="PDF", save_all=True, append_images=rest)
+    return output.getvalue()
 
 
 def convert_zip_images_to_pdf(zip_bytes):
@@ -598,6 +617,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["mode"] = None
+    context.user_data["connect_images"] = []
+    context.user_data.pop("connect_status_msg_id", None)
     await update.message.reply_text(
         "یکی از حالت‌ها رو انتخاب کن:",
         reply_markup=main_menu()
@@ -607,6 +628,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # برای اینکه راحت آیدی عددی هر کسی رو بفهمی و به لیست اضافه کنی
     await update.message.reply_text(f"آیدی عددی شما: {update.effective_user.id}")
+
+
+async def handle_connect_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    images_list = context.user_data.get("connect_images", [])
+
+    if not images_list:
+        await query.answer("هنوز عکسی نفرستادی.", show_alert=True)
+        return
+
+    await query.edit_message_text(f"⏳ در حال ساخت PDF از {len(images_list)} عکس...")
+
+    sorted_entries = sorted(images_list, key=lambda entry: _natural_sort_key(entry[0]))
+    pdf_bytes = images_bytes_to_pdf(sorted_entries)
+
+    context.user_data["mode"] = None
+    context.user_data["connect_images"] = []
+    context.user_data.pop("connect_status_msg_id", None)
+
+    if pdf_bytes is None:
+        await query.message.reply_text("❌ نتونستم از عکس‌های فرستاده‌شده PDF بسازم.")
+        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        return
+
+    await process_and_reply(query.message, "connected.pdf", pdf_bytes, context)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,6 +699,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "توی یه PDF چندصفحه‌ای چسبونده میشن.",
             reply_markup=main_menu()
         )
+    elif data == "mode_connect":
+        context.user_data["mode"] = "connect"
+        context.user_data["connect_images"] = []
+        context.user_data.pop("connect_status_msg_id", None)
+        await query.edit_message_text(
+            "حالت «اتصال عکس‌ها به PDF» فعال شد ✅\n\n"
+            "عکس‌ها رو یکی‌یکی، به‌صورت «فایل» (Document) بفرست — نه عکس فشرده، "
+            "چون تلگرام موقع فشرده‌سازی اسم فایل رو حذف می‌کنه.\n"
+            "اسم هر عکس باید با شماره باشه (مثل 01.jpg، 02.jpg، ...) — بات بر اساس "
+            "همین شماره‌ها ترتیب صفحات PDF نهایی رو تعیین می‌کنه، نه ترتیب ارسال.\n\n"
+            "وقتی همه رو فرستادی، زیر آخرین عکس دکمه‌ی «✅ تمام» رو بزن."
+        )
+    elif data == "connect_done":
+        await handle_connect_done(update, context)
+    elif data == "connect_cancel":
+        context.user_data["mode"] = None
+        context.user_data["connect_images"] = []
+        context.user_data.pop("connect_status_msg_id", None)
+        await query.edit_message_text("❌ لغو شد.")
+        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
 
 async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE):
@@ -759,6 +825,65 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.delete()
         base_name = os.path.splitext(msg.document.file_name or "converted")[0]
         await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context)
+        return
+
+    elif mode == "connect":
+        # این حالت عکس (به‌صورت فایل/Document ترجیحاً، یا عکس فشرده) قبول می‌کنه
+        images_list = context.user_data.setdefault("connect_images", [])
+
+        is_image_doc = (
+            msg.document
+            and msg.document.mime_type
+            and msg.document.mime_type.startswith("image/")
+        )
+
+        if is_image_doc:
+            file_obj = await msg.document.get_file()
+            filename = msg.document.file_name or f"image_{len(images_list) + 1:03d}.jpg"
+        elif msg.photo:
+            # عکس فشرده - اسم اصلی نداره، پس بر اساس ترتیب دریافت اسم می‌ذاریم
+            file_obj = await msg.photo[-1].get_file()
+            filename = f"photo_{len(images_list) + 1:03d}.jpg"
+        else:
+            await msg.reply_text(
+                "⚠️ تو حالت «اتصال عکس‌ها» فقط عکس (فایل یا عکس فشرده) قبول میشه."
+            )
+            return
+
+        try:
+            file_bytes = bytes(await file_obj.download_as_bytearray())
+        except Exception as e:
+            await msg.reply_text(f"❌ خطا توی دریافت عکس: {e}")
+            return
+
+        images_list.append((filename, file_bytes))
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ تمام", callback_data="connect_done"),
+                InlineKeyboardButton("❌ انصراف", callback_data="connect_cancel"),
+            ]
+        ])
+        status_text = f"📥 {len(images_list)} عکس دریافت شد. وقتی تموم شد «تمام» رو بزن."
+
+        last_status_id = context.user_data.get("connect_status_msg_id")
+        edited = False
+        if last_status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=msg.chat_id,
+                    message_id=last_status_id,
+                    text=status_text,
+                    reply_markup=keyboard,
+                )
+                edited = True
+            except Exception:
+                edited = False
+
+        if not edited:
+            sent = await msg.reply_text(status_text, reply_markup=keyboard)
+            context.user_data["connect_status_msg_id"] = sent.message_id
+
         return
 
     else:
