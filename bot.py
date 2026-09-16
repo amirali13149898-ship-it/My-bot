@@ -188,6 +188,7 @@ def main_menu():
         [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
         [InlineKeyboardButton("📦 زیپ عکس‌ها به PDF", callback_data="mode_zip")],
         [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
+        [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -619,6 +620,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = None
     context.user_data["connect_images"] = []
     context.user_data.pop("connect_status_msg_id", None)
+    context.user_data["bulk_files"] = []
+    context.user_data.pop("bulk_status_msg_id", None)
     await update.message.reply_text(
         "یکی از حالت‌ها رو انتخاب کن:",
         reply_markup=main_menu()
@@ -653,6 +656,110 @@ async def handle_connect_done(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await process_and_reply(query.message, "connected.pdf", pdf_bytes, context)
+
+
+# ==================== بخش آپلود گروهی ====================
+
+async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    وقتی کاربر توی حالت «آپلود گروهی» دکمه‌ی «تمام» رو بزنه، این تابع
+    همه‌ی فایل‌های جمع‌شده (PDF یا ZIP) رو یکی‌یکی پردازش و به Catbox
+    آپلود می‌کنه، بعد نتیجه رو با اسم هر فایل زیر لینکش گزارش می‌ده.
+    """
+    query = update.callback_query
+    files_list = context.user_data.get("bulk_files", [])
+
+    if not files_list:
+        await query.answer("هنوز فایلی نفرستادی.", show_alert=True)
+        return
+
+    total = len(files_list)
+    await query.edit_message_text(f"⏳ در حال آپلود {total} فایل...")
+
+    results = []  # لیست (label, link یا None, پیام‌خطا یا None)
+
+    for idx, item in enumerate(files_list, start=1):
+        label = item["label"]
+        raw_bytes = item["bytes"]
+        kind = item["kind"]
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                text=f"⏳ در حال آپلود {idx} از {total}...\n(فایل فعلی: {label})"
+            )
+        except Exception:
+            pass
+
+        if kind == "zip":
+            try:
+                pdf_bytes = convert_zip_images_to_pdf(raw_bytes)
+            except ZipContainsNonImageError:
+                results.append((label, None, "زیپ باید فقط شامل عکس باشه"))
+                continue
+            except Exception as e:
+                results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
+                continue
+
+            if pdf_bytes is None:
+                results.append((label, None, "هیچ عکسی توی زیپ پیدا نشد یا زیپ خراب بود"))
+                continue
+
+            upload_bytes = pdf_bytes
+            upload_filename = f"{label}.pdf"
+        else:
+            upload_bytes = raw_bytes
+            upload_filename = label if label.lower().endswith(".pdf") else f"{label}.pdf"
+
+        link = upload_catbox(upload_filename, upload_bytes)
+        if link:
+            results.append((label, link, None))
+        else:
+            results.append((label, None, "آپلود به Catbox ناموفق بود"))
+
+    # ساخت پیام‌های نهایی: اسم فایل بالا، لینک (یا خطا) زیرش
+    lines = []
+    for label, link, error in results:
+        if link:
+            lines.append(f"📄 <b>{label}</b>\n<code>{link}</code>")
+        else:
+            lines.append(f"📄 <b>{label}</b>\n⚠️ {error}")
+
+    # پیام‌ها رو به چند تیکه تقسیم می‌کنیم تا از محدودیت طول پیام تلگرام رد نشیم
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = (current + "\n\n" + line) if current else line
+        if len(candidate) > 3500:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    success_count = sum(1 for _, link, _ in results if link)
+    header = f"✅ آپلود گروهی تمام شد ({success_count} از {total} موفق):"
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat_id,
+            message_id=query.message.message_id,
+            text=header
+        )
+    except Exception:
+        await query.message.reply_text(header)
+
+    for chunk in chunks:
+        await query.message.reply_text(chunk, parse_mode="HTML")
+
+    context.user_data["mode"] = None
+    context.user_data["bulk_files"] = []
+    context.user_data.pop("bulk_status_msg_id", None)
+    await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+
+# ==================== پایان بخش آپلود گروهی ====================
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -717,6 +824,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = None
         context.user_data["connect_images"] = []
         context.user_data.pop("connect_status_msg_id", None)
+        await query.edit_message_text("❌ لغو شد.")
+        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+    elif data == "mode_bulk":
+        context.user_data["mode"] = "bulk_upload"
+        context.user_data["bulk_files"] = []
+        context.user_data.pop("bulk_status_msg_id", None)
+        await query.edit_message_text(
+            "حالت «آپلود گروهی» فعال شد ✅\n\n"
+            "فایل‌های PDF یا ZIP رو یکی‌یکی بفرست — نوع هر فایل خودکار تشخیص "
+            "داده میشه (PDF مستقیم آپلود میشه، ZIP اول به PDF تبدیل میشه).\n\n"
+            "وقتی همه رو فرستادی، زیر آخرین فایل دکمه‌ی «✅ تمام» رو بزن تا "
+            "همه یکی‌یکی لینک بشن (اسم هر فایل بالای لینکش نوشته میشه)."
+        )
+    elif data == "bulk_done":
+        await handle_bulk_done(update, context)
+    elif data == "bulk_cancel":
+        context.user_data["mode"] = None
+        context.user_data["bulk_files"] = []
+        context.user_data.pop("bulk_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
@@ -883,6 +1009,76 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not edited:
             sent = await msg.reply_text(status_text, reply_markup=keyboard)
             context.user_data["connect_status_msg_id"] = sent.message_id
+
+        return
+
+    elif mode == "bulk_upload":
+        # این حالت هم PDF قبول می‌کنه هم ZIP - نوعش خودکار تشخیص داده میشه
+        files_list = context.user_data.setdefault("bulk_files", [])
+
+        is_pdf = (
+            msg.document
+            and (
+                msg.document.mime_type == "application/pdf"
+                or (msg.document.file_name and msg.document.file_name.lower().endswith(".pdf"))
+            )
+        )
+        is_zip = (
+            msg.document
+            and (
+                msg.document.mime_type in ("application/zip", "application/x-zip-compressed")
+                or (msg.document.file_name and msg.document.file_name.lower().endswith(".zip"))
+            )
+        )
+
+        if not (is_pdf or is_zip):
+            await msg.reply_text(
+                "⚠️ تو حالت «آپلود گروهی» فقط فایل PDF یا ZIP قبول میشه."
+            )
+            return
+
+        try:
+            file_obj = await msg.document.get_file()
+            file_bytes = bytes(await file_obj.download_as_bytearray())
+        except Exception as e:
+            await msg.reply_text(f"❌ خطا توی دریافت فایل: {e}")
+            return
+
+        original_name = msg.document.file_name or f"file_{len(files_list) + 1:02d}"
+        label = os.path.splitext(original_name)[0] or f"file_{len(files_list) + 1:02d}"
+        kind = "pdf" if is_pdf else "zip"
+        files_list.append({"label": label, "bytes": file_bytes, "kind": kind})
+
+        pdf_count = sum(1 for f in files_list if f["kind"] == "pdf")
+        zip_count = sum(1 for f in files_list if f["kind"] == "zip")
+        status_text = (
+            f"📥 {len(files_list)} فایل دریافت شد ({pdf_count} PDF، {zip_count} ZIP).\n"
+            "وقتی تموم شد «تمام» رو بزن."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ تمام", callback_data="bulk_done"),
+                InlineKeyboardButton("❌ انصراف", callback_data="bulk_cancel"),
+            ]
+        ])
+
+        last_status_id = context.user_data.get("bulk_status_msg_id")
+        edited = False
+        if last_status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=msg.chat_id,
+                    message_id=last_status_id,
+                    text=status_text,
+                    reply_markup=keyboard,
+                )
+                edited = True
+            except Exception:
+                edited = False
+
+        if not edited:
+            sent = await msg.reply_text(status_text, reply_markup=keyboard)
+            context.user_data["bulk_status_msg_id"] = sent.message_id
 
         return
 
