@@ -9,6 +9,7 @@ import img2pdf
 from PIL import Image
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler, filters,
     CommandHandler, CallbackQueryHandler
@@ -1146,7 +1147,17 @@ def main():
 
     threading.Thread(target=run_web, daemon=True).start()
 
-    builder = ApplicationBuilder().token(BOT_TOKEN)
+    # timeoutهای پیش‌فرض کتابخونه فقط ۵ ثانیه‌ست که برای فایل‌های حجیم
+    # (بالای ۲۰ مگ که از Local Bot API Server دانلود/آپلود میشن) کافی
+    # نیست و باعث خطای "Timed out" می‌شد. اینجا بیشترشون می‌کنیم.
+    custom_request = HTTPXRequest(
+        connect_timeout=60,
+        read_timeout=120,
+        write_timeout=120,
+        pool_timeout=60,
+    )
+
+    builder = ApplicationBuilder().token(BOT_TOKEN).request(custom_request)
 
     if USE_LOCAL_BOT_API:
         print(f"✅ اتصال به Local Bot API Server: {LOCAL_BOT_API_URL}")
