@@ -2,3 +2,4 @@ python-telegram-bot
 requests
 flask
 Pillow
+img2pdf
