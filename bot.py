@@ -5,6 +5,7 @@ import json
 import zipfile
 import threading
 import requests
+import img2pdf
 from PIL import Image
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -207,36 +208,66 @@ class ZipContainsNonImageError(Exception):
     pass
 
 
+def _prepare_image_bytes_for_pdf(raw):
+    """
+    عکس رو برای چسبوندن به PDF آماده می‌کنه، با اولویت اول: هیچ افت
+    کیفیتی نده. اگه فرمت عکس مستقیم قابل embed کردن توی PDF باشه (مثلاً
+    JPEG یا PNG بدون آلفا)، همون بایت اصلی و دست‌نخورده رو برمی‌گردونه —
+    img2pdf این‌ها رو بدون دیکد کردن به پیکسل خام مستقیم می‌چسبونه، پس نه
+    کیفیت افت می‌کنه نه رم زیادی مصرف میشه.
+    فقط برای فرمت‌های ناسازگار (آلفا/پالت/...) یه بار تبدیل به JPEG
+    باکیفیت بالا (quality=95) انجام میشه تا img2pdf بتونه قبولش کنه.
+    اگه عکس اصلاً خراب/نامعتبر باشه None برمی‌گردونه.
+    """
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.verify()
+    except Exception:
+        return None
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            if img.mode not in ("RGB", "L", "CMYK"):
+                raise ValueError("needs conversion")
+        return raw
+    except Exception:
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                return buf.getvalue()
+        except Exception:
+            return None
+
+
 def images_bytes_to_pdf(entries):
     """
     entries: لیستی از (filename, raw_bytes) که از قبل به ترتیب دلخواه
-    مرتب شده. عکس‌های معتبر رو می‌خونه و توی یه PDF چندصفحه‌ای می‌چسبونه.
-    اگه هیچ عکس معتبری توی entries نباشه، None برمی‌گردونه.
+    مرتب شده. عکس‌های معتبر رو بدون افت کیفیت و بدون دیکد کامل هم‌زمان
+    (که باعث پر شدن رم روی سرور رایگان میشه) توی یه PDF چندصفحه‌ای
+    می‌چسبونه. اگه هیچ عکس معتبری توی entries نباشه، None برمی‌گردونه.
     """
-    images = []
+    prepared = []
     for _name, raw in entries:
-        try:
-            img = Image.open(io.BytesIO(raw))
-            img.load()
-        except Exception:
-            continue
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        images.append(img)
+        fixed = _prepare_image_bytes_for_pdf(raw)
+        if fixed is not None:
+            prepared.append(fixed)
 
-    if not images:
+    if not prepared:
         return None
 
-    output = io.BytesIO()
-    first, rest = images[0], images[1:]
-    first.save(output, format="PDF", save_all=True, append_images=rest)
-    return output.getvalue()
+    try:
+        return img2pdf.convert(prepared)
+    except Exception:
+        return None
 
 
 def convert_zip_images_to_pdf(zip_bytes):
     """
     عکس‌های داخل یه فایل زیپ رو می‌خونه، به ترتیب اسم مرتب می‌کنه و
-    همه رو توی یه PDF چندصفحه‌ای می‌چسبونه.
+    همه رو بدون افت کیفیت توی یه PDF چندصفحه‌ای می‌چسبونه.
 
     اگه حتی یه فایل غیرعکس (هر فرمتی جز IMAGE_EXTENSIONS) توی زیپ باشه،
     ZipContainsNonImageError میده و کل عملیات متوقف میشه.
@@ -262,24 +293,22 @@ def convert_zip_images_to_pdf(zip_bytes):
 
             entries.sort(key=_natural_sort_key)
 
-            images = []
+            prepared = []
             for name in entries:
                 with zf.open(name) as f:
-                    img = Image.open(io.BytesIO(f.read()))
-                    img.load()
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    images.append(img)
+                    fixed = _prepare_image_bytes_for_pdf(f.read())
+                    if fixed is not None:
+                        prepared.append(fixed)
     except zipfile.BadZipFile:
         return None
 
-    if not images:
+    if not prepared:
         return None
 
-    output = io.BytesIO()
-    first, rest = images[0], images[1:]
-    first.save(output, format="PDF", save_all=True, append_images=rest)
-    return output.getvalue()
+    try:
+        return img2pdf.convert(prepared)
+    except Exception:
+        return None
 
 
 def user_display_name(user):
