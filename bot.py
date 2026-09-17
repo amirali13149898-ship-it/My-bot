@@ -17,6 +17,15 @@ from telegram.ext import (
 # ===== تنظیمات - توکن از Environment Variable خونده میشه =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# ===== تنظیمات Local Bot API Server =====
+# اگه USE_LOCAL_BOT_API روشن باشه (پیش‌فرض: روشن)، بات به‌جای
+# api.telegram.org به سرور محلی telegram-bot-api که توی همین کانتینر
+# اجرا میشه وصل میشه - همینه که محدودیت حجم فایل رو از ۲۰/۵۰ مگابایت
+# به ۲ گیگابایت می‌بره بالا.
+USE_LOCAL_BOT_API = os.environ.get("USE_LOCAL_BOT_API", "true").lower() == "true"
+LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "http://localhost:8081")
+# ================================================================
+
 # آیدی عددی کاربرهایی که از قبل اجازه استفاده دارن (فقط برای اولین بار / seed)
 ALLOWED_USER_IDS = {
     int(uid.strip())
@@ -1137,7 +1146,20 @@ def main():
 
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+
+    if USE_LOCAL_BOT_API:
+        print(f"✅ اتصال به Local Bot API Server: {LOCAL_BOT_API_URL}")
+        builder = (
+            builder
+            .base_url(f"{LOCAL_BOT_API_URL}/bot")
+            .base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
+            .local_mode(True)
+        )
+    else:
+        print("⚠️ Local Bot API غیرفعاله - از api.telegram.org استفاده میشه (سقف ۲۰/۵۰ مگابایت).")
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
