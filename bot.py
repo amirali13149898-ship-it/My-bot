@@ -4,6 +4,7 @@ import re
 import json
 import zipfile
 import threading
+import asyncio
 import requests
 import img2pdf
 import rarfile
@@ -712,7 +713,7 @@ async def handle_connect_done(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(f"⏳ در حال ساخت PDF از {len(images_list)} عکس...")
 
     sorted_entries = sorted(images_list, key=lambda entry: _natural_sort_key(entry[0]))
-    pdf_bytes = images_bytes_to_pdf(sorted_entries)
+    pdf_bytes = await asyncio.to_thread(images_bytes_to_pdf, sorted_entries)
 
     context.user_data["mode"] = None
     context.user_data["connect_images"] = []
@@ -762,7 +763,7 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if kind == "zip":
             try:
-                pdf_bytes = convert_zip_images_to_pdf(raw_bytes)
+                pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
             except Exception as e:
                 results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
                 continue
@@ -777,7 +778,7 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upload_bytes = raw_bytes
             upload_filename = label if label.lower().endswith(".pdf") else f"{label}.pdf"
 
-        link = upload_catbox(upload_filename, upload_bytes)
+        link = await asyncio.to_thread(upload_catbox, upload_filename, upload_bytes)
         if link:
             results.append((label, link, None))
         else:
@@ -927,7 +928,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text("در حال آپلود...")
 
-    link = upload_catbox(filename, file_bytes)
+    link = await asyncio.to_thread(upload_catbox, filename, file_bytes)
 
     if link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
@@ -1005,7 +1006,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             zip_file_obj = await msg.document.get_file()
             zip_bytes = await zip_file_obj.download_as_bytearray()
-            pdf_bytes = convert_zip_images_to_pdf(bytes(zip_bytes))
+            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, bytes(zip_bytes))
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -1046,7 +1047,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             rar_file_obj = await msg.document.get_file()
             rar_bytes = await rar_file_obj.download_as_bytearray()
-            pdf_bytes = convert_rar_images_to_pdf(bytes(rar_bytes))
+            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, bytes(rar_bytes))
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش رار پیش اومد: {e}")
             context.user_data["mode"] = None
