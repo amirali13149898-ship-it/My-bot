@@ -3,3 +3,4 @@ requests
 flask
 Pillow
 img2pdf
+rarfile
