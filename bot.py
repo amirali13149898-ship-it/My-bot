@@ -5,6 +5,7 @@ import json
 import time
 import zipfile
 import uuid
+import mimetypes
 import threading
 import asyncio
 import requests
@@ -182,6 +183,14 @@ def run_web():
 
 CATBOX_API = "https://catbox.moe/user/api.php"
 
+# ===== ImgBB (فقط برای «آپلود کاور») =====
+# کلید API رو از https://api.imgbb.com بگیر و توی Environment Variables سرویس
+# (مثلاً روی Render) با اسم IMGBB_API_KEY ست کن. بدون تاریخ انقضا آپلود
+# می‌کنیم، پس عکس‌ها دائمی می‌مونن. اگه کلید ست نباشه، کاورها مثل قبل
+# روی Catbox آپلود میشن.
+IMGBB_API = "https://api.imgbb.com/1/upload"
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "").strip()
+
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
 
 
@@ -311,6 +320,46 @@ def upload_catbox(filename, file_bytes, progress_cb=None):
     return None
 
 
+def upload_imgbb(filename, file_bytes, progress_cb=None):
+    """
+    آپلود عکس به ImgBB (بدون expiration => دائمی). لینک مستقیم عکس
+    (data.url) رو برمی‌گردونه یا None. مثل upload_catbox، progress_cb
+    می‌تونه TaskCancelled پرتاب کنه تا آپلود قطع بشه.
+    """
+    try:
+        mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+        encoder = MultipartEncoder(fields={
+            "key": IMGBB_API_KEY,
+            "image": (filename, io.BytesIO(bytes(file_bytes)), mime),
+        })
+        total = encoder.len
+
+        def _on_read(monitor):
+            if progress_cb:
+                progress_cb(monitor.bytes_read, total)
+
+        monitor = MultipartEncoderMonitor(encoder, _on_read)
+        r = requests.post(
+            IMGBB_API,
+            data=monitor,
+            headers={"Content-Type": monitor.content_type},
+            timeout=300,
+        )
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code == 200 and data.get("success"):
+            return data["data"]["url"]
+        # دلیل خطا (مثلاً کلید اشتباه) توی لاگ سرور چاپ میشه
+        print(f"⚠️ ImgBB خطا داد: HTTP {r.status_code} - {str(data)[:200]}")
+    except TaskCancelled:
+        raise
+    except Exception as e:
+        print(f"⚠️ ImgBB آپلود نشد: {e}")
+    return None
+
+
 async def _safe_edit(status_msg, text, reply_markup=None):
     # نکته: ادیت بدون reply_markup دکمه‌های پیام رو پاک می‌کنه، برای همین
     # هر ادیتِ پیشرفت باید دکمه‌ی لغو رو دوباره بفرسته.
@@ -320,7 +369,7 @@ async def _safe_edit(status_msg, text, reply_markup=None):
         pass
 
 
-async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="", task_id=None):
+async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="", task_id=None, uploader=None):
     """
     upload_catbox رو توی یه ترد جدا اجرا می‌کنه (تا بلاک نکنه) و پیام status_msg
     رو حداکثر هر PROGRESS_UPDATE_INTERVAL ثانیه با درصد واقعیِ آپلود، حجم،
@@ -363,7 +412,7 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
         asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text, kb), loop)
 
     try:
-        link = await asyncio.to_thread(upload_catbox, filename, file_bytes, progress_cb)
+        link = await asyncio.to_thread(uploader or upload_catbox, filename, file_bytes, progress_cb)
         if state["cancelled"] and not link:
             raise TaskCancelled()
         return link
@@ -1196,13 +1245,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
 
-async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None):
+async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None, host="catbox"):
     status = status_msg or await msg.reply_text("در حال آپلود...")
+
+    # کاورها (عکس) به ImgBB میرن؛ اگه کلیدش ست نشده باشه، Catbox
+    if host == "imgbb" and not IMGBB_API_KEY:
+        host = "catbox"
+    host_name = "ImgBB" if host == "imgbb" else "Catbox"
+    uploader = upload_imgbb if host == "imgbb" else upload_catbox
 
     cancelled = False
     try:
         link = await upload_catbox_with_progress(
-            filename, file_bytes, status, prefix=f"⬆️ در حال آپلود «{filename}»"
+            filename, file_bytes, status, prefix=f"⬆️ در حال آپلود «{filename}»",
+            uploader=uploader
         )
     except TaskCancelled:
         cancelled = True
@@ -1213,11 +1269,11 @@ async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEF
     elif link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
         await status.edit_text(
-            f"✅ آپلود شد (Catbox)\nلینک مستقیم:\n<code>{link}</code>",
+            f"✅ آپلود شد ({host_name})\nلینک مستقیم:\n<code>{link}</code>",
             parse_mode="HTML"
         )
     else:
-        await status.edit_text("❌ آپلود ناموفق بود، Catbox جواب نداد.")
+        await status.edit_text(f"❌ آپلود ناموفق بود، {host_name} جواب نداد.")
 
     # ریست کردن حالت و نمایش دوباره‌ی منو بعد از هر آپلود
     context.user_data["mode"] = None
@@ -1513,7 +1569,10 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_src, status, getattr(file_src, "file_size", None),
             prefix=f"⬇️ در حال دریافت {filename}..."
         )
-        await process_and_reply(msg, filename, file_bytes, context, status_msg=status)
+        await process_and_reply(
+            msg, filename, file_bytes, context, status_msg=status,
+            host="imgbb" if mode == "cover" else "catbox"
+        )
     except TaskCancelled:
         if status:
             await _safe_edit(status, "❌ دریافت فایل لغو شد.")
@@ -1546,6 +1605,11 @@ def main():
     else:
         print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
               "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
+
+    if IMGBB_API_KEY:
+        print("✅ کاورها روی ImgBB آپلود میشن (دائمی).")
+    else:
+        print("⚠️ IMGBB_API_KEY ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
 
     threading.Thread(target=run_web, daemon=True).start()
 
