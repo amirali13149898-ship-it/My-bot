@@ -14,6 +14,19 @@ import img2pdf
 import pypdf
 import rarfile
 from PIL import Image
+
+# ===== پشتیبانی از فرمت‌های اضافه‌ی عکس =====
+# HEIC/HEIF (فرمت پیش‌فرض آیفون) و AVIF از طریق پلاگین به پیلو اضافه
+# میشن - بعد از این import‌ها، Image.open خودش این فرمت‌ها رو هم می‌فهمه.
+import pillow_heif
+pillow_heif.register_heif_opener()
+import pillow_avif  # noqa: F401  (صرفاً import شدنش کافیه، پلاگین AVIF رو ثبت می‌کنه)
+
+# RAW دوربین (CR2/CR3/NEF/ARW/DNG) - پیلو این‌ها رو نمی‌فهمه، باید جدا دیکد بشن
+import rawpy
+
+# SVG (وکتور) - قبل از هرکاری باید به PNG رندر بشه
+import cairosvg
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
@@ -550,7 +563,19 @@ def main_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff")
+IMAGE_EXTENSIONS = (
+    # راستری معمولی
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif",
+    # فرمت گوشی/مرورگر
+    ".heic", ".heif", ".avif",
+    # وکتور
+    ".svg", ".eps", ".ai",
+    # خام دوربین (RAW)
+    ".cr2", ".cr3", ".nef", ".arw", ".dng",
+)
+# پسوندهایی که واقعاً "خام دوربین" هستن و پیلو مستقیم بازشون نمی‌کنه؛
+# این‌ها با rawpy دیکد میشن (نه فقط به‌عنوان fallback روی محتوای نامعتبر).
+RAW_EXTENSIONS = (".cr2", ".cr3", ".nef", ".arw", ".dng")
 NESTED_ARCHIVE_MAX_DEPTH = 3
 
 
@@ -560,14 +585,22 @@ def _natural_sort_key(name):
             for part in re.split(r"(\d+)", name)]
 
 
+def _looks_like_svg(raw):
+    # فایل SVG واقعاً یه متن XML‌ـه، نه یه فرمت باینری با امضای مشخص؛
+    # برای همین دنبال تگ <svg توی چند صد بایت اول می‌گردیم.
+    head = raw[:1000].lower()
+    return b"<svg" in head
+
+
 def _to_img2pdf_bytes(raw):
     """
     اگه بایت خام عکس مستقیم توسط img2pdf قابل embed باشه (بدون دیکد
     شدن به بیت‌مپ)، همون بایت اصلی و دست‌نخورده برگردونده میشه —
     یعنی صفر افت کیفیت و کمترین مصرف رم.
     اگه فرمت مشکل‌دار باشه (PNG با کانال آلفا، حالت پالت، یا فرمتی
-    غیر از JPEG/PNG مثل webp/bmp/gif/tiff)، فقط همون یه عکس یک بار
-    با کیفیت ۹۵٪ به JPEG تبدیل میشه تا img2pdf بتونه قبولش کنه.
+    غیر از JPEG/PNG مثل webp/bmp/gif/tiff/heic/avif)، یا وکتور (SVG/AI/EPS)
+    یا خام دوربین (CR2/CR3/NEF/ARW/DNG) باشه، یه بار دیکد و با کیفیت
+    ۹۵٪ به JPEG تبدیل میشه تا img2pdf بتونه قبولش کنه.
     اگه عکس اصلاً خراب/نامعتبر باشه None برمی‌گردونه.
     """
     try:
@@ -575,9 +608,42 @@ def _to_img2pdf_bytes(raw):
         return raw
     except Exception:
         pass
+
+    img = None
+
+    # SVG (وکتور) - اول باید به PNG رندر بشه، بعد مثل یه عکس معمولی ادامه پیدا کنه
+    if _looks_like_svg(raw):
+        try:
+            png_bytes = cairosvg.svg2png(bytestring=raw, output_width=2000)
+            img = Image.open(io.BytesIO(png_bytes))
+            img.load()
+        except Exception:
+            img = None
+
+    # فرمت‌های راستری معمولی + HEIC/HEIF/AVIF (با پلاگین‌های بالای فایل) +
+    # EPS و AI قدیمی (پیلو خودش از طریق Ghostscript بازشون می‌کنه)
+    if img is None:
+        try:
+            candidate = Image.open(io.BytesIO(raw))
+            candidate.load()
+            img = candidate
+        except Exception:
+            img = None
+
+    # خام دوربین (RAW): CR2/CR3/NEF/ARW/DNG - پیلو این‌ها رو نمی‌فهمه،
+    # با rawpy (لایبراری libraw) دیکد میشن
+    if img is None:
+        try:
+            with rawpy.imread(io.BytesIO(raw)) as raw_img:
+                rgb = raw_img.postprocess()
+            img = Image.fromarray(rgb)
+        except Exception:
+            img = None
+
+    if img is None:
+        return None
+
     try:
-        img = Image.open(io.BytesIO(raw))
-        img.load()
         if img.mode != "RGB":
             img = img.convert("RGB")
         buf = io.BytesIO()
@@ -636,9 +702,18 @@ def _classify_entry(name, raw):
     # پسوند ناشناخته یا گمراه‌کننده -> از روی محتوای واقعی تشخیص بده
     if raw[:4] == b"%PDF":
         return "pdf"
+    if _looks_like_svg(raw):
+        return "image"
     try:
         with Image.open(io.BytesIO(raw)) as im:
             im.verify()
+        return "image"
+    except Exception:
+        pass
+    # شاید خام دوربین (CR2/CR3/NEF/ARW/DNG) باشه که پیلو نمی‌فهمتش
+    try:
+        with rawpy.imread(io.BytesIO(raw)):
+            pass
         return "image"
     except Exception:
         return None
@@ -797,7 +872,11 @@ async def _convert_to_pdf_and_upload(msg, context, kind, file_src, filename):
             pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
         elif kind == "rar":
             pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, raw_bytes)
-        else:  # image
+        elif raw_bytes[:4] == b"%PDF":
+            # خیلی از فایل‌های .ai جدید در واقع یه PDF معتبرن (نسخه‌ی
+            # PDF-compatible ایلوستریتور) - نیازی به تبدیل نیست، مستقیم پاس داده میشه
+            pdf_bytes = raw_bytes
+        else:  # image (شامل عکس معمولی، HEIC/AVIF، SVG، RAW، یا AI/EPS قدیمی)
             pdf_bytes = await asyncio.to_thread(images_bytes_to_pdf, [(filename, raw_bytes)])
     except Exception as e:
         await status.edit_text(f"❌ خطایی توی تبدیل به PDF پیش اومد: {e}")
@@ -1533,10 +1612,9 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # این حالت عکس (به‌صورت فایل/Document ترجیحاً، یا عکس فشرده) قبول می‌کنه
         images_list = context.user_data.setdefault("connect_images", [])
 
-        is_image_doc = (
-            msg.document
-            and msg.document.mime_type
-            and msg.document.mime_type.startswith("image/")
+        is_image_doc = msg.document and (
+            (msg.document.mime_type and msg.document.mime_type.startswith("image/"))
+            or (msg.document.file_name and msg.document.file_name.lower().endswith(IMAGE_EXTENSIONS))
         )
 
         if is_image_doc:
