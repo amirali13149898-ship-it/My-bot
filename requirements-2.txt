@@ -1,0 +1,7 @@
+python-telegram-bot
+requests
+requests-toolbelt
+flask
+Pillow
+img2pdf
+rarfile
