@@ -542,10 +542,8 @@ async def download_with_progress(file_src, status_msg, total_size, prefix="⬇�
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("📷 آپلود کاور", callback_data="mode_cover")],
-        [
-            InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf"),
-            InlineKeyboardButton("🔄 تغییر فرمت به PDF", callback_data="mode_to_pdf"),
-        ],
+        [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
+        [InlineKeyboardButton("🔄 تغییر فرمت به PDF", callback_data="mode_to_pdf")],
         [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
         [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
     ]
