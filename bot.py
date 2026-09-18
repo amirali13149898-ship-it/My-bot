@@ -6,6 +6,7 @@ import zipfile
 import threading
 import requests
 import img2pdf
+import rarfile
 from PIL import Image
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -199,23 +200,20 @@ def main_menu():
         [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
         [InlineKeyboardButton("📦 زیپ عکس‌ها به PDF", callback_data="mode_zip")],
         [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
+        [InlineKeyboardButton("🗜️ رار عکس‌ها به PDF", callback_data="mode_rar")],
         [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff")
+NESTED_ARCHIVE_MAX_DEPTH = 3
 
 
 def _natural_sort_key(name):
     # مرتب‌سازی طبیعی: img2 قبل از img10 بیاد، نه بعدش
     return [int(part) if part.isdigit() else part.lower()
             for part in re.split(r"(\d+)", name)]
-
-
-class ZipContainsNonImageError(Exception):
-    """وقتی فایلی غیر از عکس داخل زیپ پیدا بشه این خطا داده میشه."""
-    pass
 
 
 def _to_img2pdf_bytes(raw):
@@ -266,45 +264,66 @@ def images_bytes_to_pdf(entries):
         return None
 
 
-def convert_zip_images_to_pdf(zip_bytes):
-    """
-    عکس‌های داخل یه فایل زیپ رو می‌خونه، به ترتیب اسم مرتب می‌کنه و
-    همه رو توی یه PDF چندصفحه‌ای می‌چسبونه.
+def _open_archive(archive_bytes, kind):
+    if kind == "zip":
+        return zipfile.ZipFile(io.BytesIO(archive_bytes))
+    return rarfile.RarFile(io.BytesIO(archive_bytes))
 
-    اگه حتی یه فایل غیرعکس (هر فرمتی جز IMAGE_EXTENSIONS) توی زیپ باشه،
-    ZipContainsNonImageError میده و کل عملیات متوقف میشه.
-    اگه زیپ خراب باشه یا هیچ فایلی توش نباشه None برمی‌گردونه.
+
+def _collect_images_from_archive_bytes(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
     """
+    یه فایل زیپ/رار رو باز می‌کنه و همه‌ی عکس‌های داخلش رو جمع می‌کنه.
+    اگه داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه، تا max_depth سطح
+    توش هم دنبال عکس می‌گرده. هر فایلی که نه عکسه، نه آرشیوِ قابل‌بازکردن
+    (یا عمقش از max_depth بیشتر شده)، به‌سادگی نادیده گرفته میشه - کل
+    عملیات به‌خاطر یه فایل غیرعکس متوقف نمیشه.
+    خروجی: لیستی از (name, raw_bytes) که هنوز مرتب نشده.
+    """
+    collected = []
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            entries = [
-                n for n in zf.namelist()
-                if not n.endswith("/")  # پوشه‌ها رو رد کن
-                and not os.path.basename(n).startswith(".")  # فایل‌های مخفی/سیستمی رو رد کن
+        with _open_archive(archive_bytes, kind) as af:
+            names = [
+                n for n in af.namelist()
+                if not n.endswith("/")
+                and not os.path.basename(n).startswith(".")
                 and os.path.basename(n) != ""
             ]
+            names.sort(key=_natural_sort_key)
 
-            if not entries:
-                return None
+            for name in names:
+                try:
+                    raw = af.read(name)
+                except Exception:
+                    continue
 
-            # اول چک کن که همه‌ی فایل‌ها عکس باشن - اگه حتی یکی غیرعکس بود
-            # کل عملیات متوقف میشه (قبل از اینکه هیچ عکسی پردازش بشه)
-            for name in entries:
-                if not name.lower().endswith(IMAGE_EXTENSIONS):
-                    raise ZipContainsNonImageError(name)
+                lower = name.lower()
+                if lower.endswith(IMAGE_EXTENSIONS):
+                    collected.append((name, raw))
+                elif lower.endswith(".zip") and depth < max_depth:
+                    collected.extend(
+                        _collect_images_from_archive_bytes(raw, "zip", depth + 1, max_depth)
+                    )
+                elif lower.endswith(".rar") and depth < max_depth:
+                    collected.extend(
+                        _collect_images_from_archive_bytes(raw, "rar", depth + 1, max_depth)
+                    )
+                # وگرنه: نه عکسه نه آرشیو قابل بازکردن -> نادیده گرفته میشه
+    except Exception:
+        return []
+    return collected
 
-            entries.sort(key=_natural_sort_key)
 
-            prepared = []
-            for name in entries:
-                with zf.open(name) as f:
-                    raw = f.read()
-                data = _to_img2pdf_bytes(raw)
-                if data is not None:
-                    prepared.append(data)
-    except zipfile.BadZipFile:
+def _archive_to_pdf(archive_bytes, kind):
+    entries = _collect_images_from_archive_bytes(archive_bytes, kind)
+    if not entries:
         return None
 
+    entries.sort(key=lambda e: _natural_sort_key(e[0]))
+
+    prepared = [
+        data for data in (_to_img2pdf_bytes(raw) for _name, raw in entries)
+        if data is not None
+    ]
     if not prepared:
         return None
 
@@ -312,6 +331,23 @@ def convert_zip_images_to_pdf(zip_bytes):
         return img2pdf.convert(prepared)
     except Exception:
         return None
+
+
+def convert_zip_images_to_pdf(zip_bytes):
+    """
+    عکس‌های داخل یه فایل زیپ (و زیپ/رارهای تودرتوی داخلش، تا ۳ سطح) رو
+    پیدا می‌کنه، به ترتیب اسم مرتب می‌کنه و توی یه PDF چندصفحه‌ای
+    می‌چسبونه. اگه هیچ عکسی پیدا نشه یا زیپ خراب باشه، None برمی‌گردونه.
+    """
+    return _archive_to_pdf(zip_bytes, "zip")
+
+
+def convert_rar_images_to_pdf(rar_bytes):
+    """
+    مثل convert_zip_images_to_pdf ولی برای فایل RAR (و زیپ/رارهای
+    تودرتوی داخلش، تا ۳ سطح).
+    """
+    return _archive_to_pdf(rar_bytes, "rar")
 
 
 def user_display_name(user):
@@ -727,9 +763,6 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "zip":
             try:
                 pdf_bytes = convert_zip_images_to_pdf(raw_bytes)
-            except ZipContainsNonImageError:
-                results.append((label, None, "زیپ باید فقط شامل عکس باشه"))
-                continue
             except Exception as e:
                 results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
                 continue
@@ -835,7 +868,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "حالت «زیپ عکس‌ها به PDF» فعال شد ✅\n"
             "یه فایل ZIP بفرست که توش عکس باشه؛ عکس‌ها به ترتیب اسمشون "
-            "توی یه PDF چندصفحه‌ای چسبونده میشن.",
+            "توی یه PDF چندصفحه‌ای چسبونده میشن.\n"
+            "اگه داخل زیپ یه زیپ یا رار دیگه هم باشه (تا ۳ سطح تودرتو)، "
+            "عکس‌های اونم پیدا میشه؛ فایل‌های غیرعکس نادیده گرفته میشن.",
             reply_markup=main_menu()
         )
     elif data == "mode_connect":
@@ -858,6 +893,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("connect_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+    elif data == "mode_rar":
+        context.user_data["mode"] = "rar_to_pdf"
+        await query.edit_message_text(
+            "حالت «رار عکس‌ها به PDF» فعال شد ✅\n"
+            "یه فایل RAR بفرست که توش عکس باشه؛ عکس‌ها به ترتیب اسمشون "
+            "توی یه PDF چندصفحه‌ای چسبونده میشن.\n"
+            "اگه داخل رار یه زیپ یا رار دیگه هم باشه (تا ۳ سطح تودرتو)، "
+            "عکس‌های اونم پیدا میشه؛ فایل‌های غیرعکس نادیده گرفته میشن.",
+            reply_markup=main_menu()
+        )
     elif data == "mode_bulk":
         context.user_data["mode"] = "bulk_upload"
         context.user_data["bulk_files"] = []
@@ -961,11 +1006,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zip_file_obj = await msg.document.get_file()
             zip_bytes = await zip_file_obj.download_as_bytearray()
             pdf_bytes = convert_zip_images_to_pdf(bytes(zip_bytes))
-        except ZipContainsNonImageError:
-            await status.edit_text("⚠️ باید در فایل شما فقط عکس باشد.")
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -974,7 +1014,48 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if pdf_bytes is None:
             await status.edit_text(
-                "❌ هیچ عکسی توی فایل زیپ پیدا نشد یا فایل زیپ خراب بود."
+                "❌ هیچ عکسی توی فایل زیپ (یا آرشیوهای تودرتوش) پیدا نشد یا فایل زیپ خراب بود."
+            )
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
+
+        await status.delete()
+        base_name = os.path.splitext(msg.document.file_name or "converted")[0]
+        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context)
+        return
+
+    elif mode == "rar_to_pdf":
+        # فقط RAR قبول میشه
+        is_rar = (
+            msg.document
+            and (
+                (msg.document.mime_type or "") in (
+                    "application/vnd.rar",
+                    "application/x-rar-compressed",
+                    "application/x-rar",
+                )
+                or (msg.document.file_name and msg.document.file_name.lower().endswith(".rar"))
+            )
+        )
+        if not is_rar:
+            await msg.reply_text("⚠️ تو حالت «رار به PDF» فقط فایل RAR قبول میشه. فایل دیگه‌ای نفرست.")
+            return
+
+        status = await msg.reply_text("در حال استخراج عکس‌ها و ساخت PDF...")
+        try:
+            rar_file_obj = await msg.document.get_file()
+            rar_bytes = await rar_file_obj.download_as_bytearray()
+            pdf_bytes = convert_rar_images_to_pdf(bytes(rar_bytes))
+        except Exception as e:
+            await status.edit_text(f"❌ خطایی توی پردازش رار پیش اومد: {e}")
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
+
+        if pdf_bytes is None:
+            await status.edit_text(
+                "❌ هیچ عکسی توی فایل رار (یا آرشیوهای تودرتوش) پیدا نشد یا فایل رار خراب بود."
             )
             context.user_data["mode"] = None
             await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
