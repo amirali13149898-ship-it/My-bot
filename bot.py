@@ -4,6 +4,7 @@ import re
 import json
 import time
 import zipfile
+import uuid
 import threading
 import asyncio
 import requests
@@ -184,8 +185,63 @@ CATBOX_API = "https://catbox.moe/user/api.php"
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
 
 
+# ===== مدیریت عملیات‌های در حال اجرا (برای دکمه‌ی «❌ لغو») =====
+# هر دانلود/آپلود یه task_id کوتاه می‌گیره. دکمه‌ی لغو همین id رو توی
+# callback_data می‌بره و button_handler با اون، عملیات درست رو متوقف می‌کنه.
+_TASKS = {}
+
+
+class TaskCancelled(Exception):
+    """وقتی کاربر دکمه‌ی «❌ لغو» رو بزنه پرتاب میشه."""
+
+
+def _new_task(chat_id):
+    task_id = uuid.uuid4().hex[:8]
+    _TASKS[task_id] = {"chat_id": chat_id, "cancelled": False, "task": None}
+    return task_id
+
+
+def _end_task(task_id):
+    _TASKS.pop(task_id, None)
+
+
+def cancel_keyboard(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ لغو", callback_data=f"cancel_task_{task_id}")]
+    ])
+
+
+# قفل جداگانه برای هر کاربر: چون آپدیت‌ها همزمان پردازش میشن (تا دکمه‌ی لغو
+# وسط آپلود کار کنه)، فایل‌های یه کاربر باید همچنان یکی‌یکی و به‌ترتیب پردازش بشن.
+_USER_LOCKS = {}
+
+
+def _user_lock(user_id):
+    lock = _USER_LOCKS.get(user_id)
+    if lock is None:
+        lock = _USER_LOCKS[user_id] = asyncio.Lock()
+    return lock
+
+
 def _format_mb(n):
     return f"{(n or 0) / (1024 * 1024):.1f}MB"
+
+
+def _format_speed(bytes_per_sec):
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / (1024 * 1024):.1f}MB/s"
+    return f"{bytes_per_sec / 1024:.0f}KB/s"
+
+
+def _format_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds} ثانیه"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} دقیقه" + (f" و {secs} ثانیه" if secs else "")
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ساعت" + (f" و {minutes} دقیقه" if minutes else "")
 
 
 def _progress_bar(done, total, width=14):
@@ -196,20 +252,38 @@ def _progress_bar(done, total, width=14):
     return "▓" * filled + "░" * (width - filled)
 
 
+def _build_upload_text(prefix, done, total, speed):
+    done = min(done, total) if total else done
+    pct = min(100, int(done * 100 / total)) if total else 0
+    lines = [
+        prefix,
+        f"[{_progress_bar(done, total)}] {pct}%",
+        f"{_format_mb(done)} / {_format_mb(total)}",
+    ]
+    if speed > 0:
+        eta = (total - done) / speed
+        lines.append(f"🚀 {_format_speed(speed)}  •  ⏳ {_format_duration(eta)} مانده")
+    else:
+        lines.append("🚀 در حال محاسبه سرعت...")
+    return "\n".join(lines)
+
+
 def upload_catbox(filename, file_bytes, progress_cb=None):
     """
     آپلود به Catbox. اگه progress_cb داده بشه، آپلود به‌صورت استریم (با
     MultipartEncoderMonitor) انجام میشه و progress_cb(bytes_sent, total_bytes)
     هر چند بار که داده واقعاً روی سوکت نوشته بشه صدا زده میشه - یعنی درصدِ
     واقعیِ آپلوده، نه یه تخمین ساختگی.
+
+    progress_cb می‌تونه TaskCancelled پرتاب کنه تا آپلود وسط کار قطع بشه.
     """
-    total = len(file_bytes)
     try:
         if progress_cb:
             encoder = MultipartEncoder(fields={
                 "reqtype": "fileupload",
                 "fileToUpload": (filename, io.BytesIO(bytes(file_bytes)), "application/octet-stream"),
             })
+            total = encoder.len  # حجم کل بدنه‌ی درخواست (فایل + هدرهای multipart)
 
             def _on_read(monitor):
                 progress_cb(monitor.bytes_read, total)
@@ -230,62 +304,123 @@ def upload_catbox(filename, file_bytes, progress_cb=None):
             )
         if r.status_code == 200 and r.text.startswith("http"):
             return r.text.strip()
+    except TaskCancelled:
+        raise
     except Exception:
         pass
     return None
 
 
-async def _safe_edit(status_msg, text):
+async def _safe_edit(status_msg, text, reply_markup=None):
+    # نکته: ادیت بدون reply_markup دکمه‌های پیام رو پاک می‌کنه، برای همین
+    # هر ادیتِ پیشرفت باید دکمه‌ی لغو رو دوباره بفرسته.
     try:
-        await status_msg.edit_text(text)
+        await status_msg.edit_text(text, reply_markup=reply_markup)
     except Exception:
         pass
 
 
-async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix=""):
+async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="", task_id=None):
     """
     upload_catbox رو توی یه ترد جدا اجرا می‌کنه (تا بلاک نکنه) و پیام status_msg
-    رو حداکثر هر PROGRESS_UPDATE_INTERVAL ثانیه با درصد واقعیِ آپلود آپدیت می‌کنه.
+    رو حداکثر هر PROGRESS_UPDATE_INTERVAL ثانیه با درصد واقعیِ آپلود، حجم،
+    سرعت و زمان باقی‌مانده آپدیت می‌کنه. زیر پیام دکمه‌ی «❌ لغو» هست.
+
+    اگه task_id داده نشه، خودش یه عملیات جدید می‌سازه (و تهش پاکش می‌کنه).
+    اگه کاربر لغو کنه TaskCancelled پرتاب میشه.
     """
+    owns_task = task_id is None
+    if owns_task:
+        task_id = _new_task(status_msg.chat_id)
+    state = _TASKS[task_id]
+    kb = cancel_keyboard(task_id)
+
     loop = asyncio.get_running_loop()
-    last_edit_at = 0.0
+    total_size = len(file_bytes)
+    start = time.monotonic()
+    tracker = {"edit_at": 0.0, "t": start, "done": 0, "speed": 0.0}
+
+    # همون لحظه‌ی شروع، دکمه‌ی لغو رو نشون بده (نه بعد از اولین ۲ ثانیه)
+    await _safe_edit(status_msg, _build_upload_text(prefix, 0, total_size or 1, 0.0), kb)
 
     def progress_cb(done, total_bytes):
-        nonlocal last_edit_at
+        if state["cancelled"]:
+            raise TaskCancelled()
         now = time.monotonic()
-        if now - last_edit_at < PROGRESS_UPDATE_INTERVAL and done < total_bytes:
+        if now - tracker["edit_at"] < PROGRESS_UPDATE_INTERVAL and done < total_bytes:
             return
-        last_edit_at = now
-        bar = _progress_bar(done, total_bytes)
-        pct = int(done * 100 / total_bytes) if total_bytes else 0
-        text = f"{prefix}\n[{bar}] {pct}%\n{_format_mb(done)} / {_format_mb(total_bytes)}"
-        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
+        dt = now - tracker["t"]
+        if dt >= 0.5:
+            inst = (done - tracker["done"]) / dt
+            # میانگین‌گیری نمایی تا سرعت و ETA مدام نپره
+            tracker["speed"] = inst if tracker["speed"] == 0 else 0.6 * tracker["speed"] + 0.4 * inst
+            tracker["t"], tracker["done"] = now, done
+        elif tracker["speed"] == 0 and now - start >= 0.2 and done > 0:
+            # آپلودهای خیلی سریع: هنوز نمونه‌ی کافی نداریم، میانگین کل رو نشون بده
+            tracker["speed"] = done / (now - start)
+        tracker["edit_at"] = now
+        text = _build_upload_text(prefix, done, total_bytes, tracker["speed"])
+        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text, kb), loop)
 
-    return await asyncio.to_thread(upload_catbox, filename, file_bytes, progress_cb)
-
-
-async def download_with_progress(file_obj, status_msg, total_size, prefix="⬇️ در حال دریافت..."):
-    """
-    دانلود فایل از تلگرام رو شروع می‌کنه و هر PROGRESS_UPDATE_INTERVAL ثانیه پیام
-    وضعیت رو آپدیت می‌کنه. توجه: سرور محلی Bot API درصد پیشرفتِ لحظه‌ای رو در
-    اختیار نمی‌ذاره (دانلود از تلگرام داخل خودِ همون درخواست انجام میشه)، پس این
-    تیکر واقعیِ زمان سپری‌شده و حجم کل فایل رو نشون میده، نه درصد جعلی.
-    """
-    task = asyncio.ensure_future(file_obj.download_as_bytearray())
-    start = time.monotonic()
     try:
-        while not task.done():
-            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
-            if task.done():
+        link = await asyncio.to_thread(upload_catbox, filename, file_bytes, progress_cb)
+        if state["cancelled"] and not link:
+            raise TaskCancelled()
+        return link
+    finally:
+        if owns_task:
+            _end_task(task_id)
+
+
+async def download_with_progress(file_src, status_msg, total_size, prefix="⬇️ در حال دریافت..."):
+    """
+    file_src یه Document/PhotoSize تلگرامه (چیزی که .get_file() داره).
+
+    توجه: توی حالت Local Bot API Server، دانلود واقعی از سرورهای تلگرام
+    داخل خودِ درخواست get_file() انجام میشه و سرور محلی درصد لحظه‌ای بهمون
+    نمی‌ده. برای همین اینجا درصد جعلی نمی‌سازیم؛ زمان سپری‌شده و حجم فایل رو
+    نشون می‌دیم. (قبلاً get_file بیرون از این تابع صدا زده می‌شد و تیکر فقط
+    روی خوندن فایل از دیسک بود - الان کل مرحله‌ی دریافت زیر تیکر و دکمه‌ی لغو هست.)
+
+    اگه کاربر لغو کنه TaskCancelled پرتاب میشه.
+    """
+    task_id = _new_task(status_msg.chat_id)
+    state = _TASKS[task_id]
+    kb = cancel_keyboard(task_id)
+    size_txt = _format_mb(total_size) if total_size else "نامشخص"
+
+    async def _work():
+        file_obj = await file_src.get_file()
+        return bytes(await file_obj.download_as_bytearray())
+
+    work = asyncio.ensure_future(_work())
+    state["task"] = work
+    start = time.monotonic()
+
+    try:
+        await _safe_edit(status_msg, f"{prefix}\n📦 حجم فایل: {size_txt}", kb)
+        while not work.done():
+            await asyncio.wait({work}, timeout=PROGRESS_UPDATE_INTERVAL)
+            if work.done():
                 break
-            elapsed = int(time.monotonic() - start)
-            size_txt = _format_mb(total_size) if total_size else "نامشخص"
-            await _safe_edit(status_msg, f"{prefix}\n⏱ {elapsed} ثانیه گذشته (حجم فایل: {size_txt})")
-        return bytes(await task)
-    except Exception:
-        if not task.done():
-            task.cancel()
+            elapsed = _format_duration(time.monotonic() - start)
+            await _safe_edit(
+                status_msg,
+                f"{prefix}\n⏱ {elapsed} گذشته\n📦 حجم فایل: {size_txt}",
+                kb,
+            )
+        try:
+            return await work
+        except asyncio.CancelledError:
+            if state["cancelled"]:
+                raise TaskCancelled()
+            raise
+    except BaseException:
+        if not work.done():
+            work.cancel()
         raise
+    finally:
+        _end_task(task_id)
 
 
 def main_menu():
@@ -836,49 +971,71 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total = len(files_list)
-    await query.edit_message_text(f"⏳ در حال آپلود {total} فایل...")
+
+    # یه دکمه‌ی لغو برای کل دسته: یعنی آپلودِ فایل فعلی قطع میشه و بقیه‌ی فایل‌ها
+    # آپلود نمیشن (لینک فایل‌هایی که قبلاً آپلود شدن حفظ میشه).
+    batch_task_id = _new_task(query.message.chat_id)
+    batch_state = _TASKS[batch_task_id]
+    batch_kb = cancel_keyboard(batch_task_id)
+
+    await query.edit_message_text(f"⏳ در حال آپلود {total} فایل...", reply_markup=batch_kb)
 
     results = []  # لیست (label, link یا None, پیام‌خطا یا None)
+    batch_cancelled = False
 
-    for idx, item in enumerate(files_list, start=1):
-        label = item["label"]
-        raw_bytes = item["bytes"]
-        kind = item["kind"]
+    try:
+        for idx, item in enumerate(files_list, start=1):
+            if batch_state["cancelled"]:
+                batch_cancelled = True
+                break
 
-        header = f"⏳ در حال آپلود {idx} از {total}\n(فایل فعلی: {label})"
-        try:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat_id,
-                message_id=query.message.message_id,
-                text=header
-            )
-        except Exception:
-            pass
+            label = item["label"]
+            raw_bytes = item["bytes"]
+            kind = item["kind"]
 
-        if kind == "zip":
+            header = f"⏳ در حال آپلود {idx} از {total}\n(فایل فعلی: {label})"
             try:
-                pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
-            except Exception as e:
-                results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
-                continue
+                await context.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=header,
+                    reply_markup=batch_kb
+                )
+            except Exception:
+                pass
 
-            if pdf_bytes is None:
-                results.append((label, None, "هیچ عکسی توی زیپ پیدا نشد یا زیپ خراب بود"))
-                continue
+            if kind == "zip":
+                try:
+                    pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
+                except Exception as e:
+                    results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
+                    continue
 
-            upload_bytes = pdf_bytes
-            upload_filename = f"{label}.pdf"
-        else:
-            upload_bytes = raw_bytes
-            upload_filename = label if label.lower().endswith(".pdf") else f"{label}.pdf"
+                if pdf_bytes is None:
+                    results.append((label, None, "هیچ عکسی توی زیپ پیدا نشد یا زیپ خراب بود"))
+                    continue
 
-        link = await upload_catbox_with_progress(
-            upload_filename, upload_bytes, query.message, prefix=header
-        )
-        if link:
-            results.append((label, link, None))
-        else:
-            results.append((label, None, "آپلود به Catbox ناموفق بود"))
+                upload_bytes = pdf_bytes
+                upload_filename = f"{label}.pdf"
+            else:
+                upload_bytes = raw_bytes
+                upload_filename = label if label.lower().endswith(".pdf") else f"{label}.pdf"
+
+            try:
+                link = await upload_catbox_with_progress(
+                    upload_filename, upload_bytes, query.message, prefix=header,
+                    task_id=batch_task_id
+                )
+            except TaskCancelled:
+                batch_cancelled = True
+                break
+
+            if link:
+                results.append((label, link, None))
+            else:
+                results.append((label, None, "آپلود به Catbox ناموفق بود"))
+    finally:
+        _end_task(batch_task_id)
 
     # ساخت پیام‌های نهایی: اسم فایل بالا، لینک (یا خطا) زیرش
     lines = []
@@ -902,7 +1059,10 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks.append(current)
 
     success_count = sum(1 for _, link, _ in results if link)
-    header = f"✅ آپلود گروهی تمام شد ({success_count} از {total} موفق):"
+    if batch_cancelled:
+        header = f"❌ آپلود گروهی لغو شد ({success_count} از {total} فایل تا اینجا آپلود شده بود):"
+    else:
+        header = f"✅ آپلود گروهی تمام شد ({success_count} از {total} موفق):"
 
     try:
         await context.bot.edit_message_text(
@@ -946,6 +1106,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ شما اجازه استفاده از این ربات رو ندارید.", show_alert=True)
         return
 
+    # دکمه‌ی «❌ لغو» زیر پیام‌های دریافت/آپلود
+    if data.startswith("cancel_task_"):
+        state = _TASKS.get(data[len("cancel_task_"):])
+        if not state or state["chat_id"] != query.message.chat_id:
+            await query.answer("این عملیات دیگه فعال نیست.")
+            return
+        state["cancelled"] = True
+        running = state.get("task")
+        if running is not None and not running.done():
+            running.cancel()  # دانلودِ در حال انتظار رو همون لحظه قطع می‌کنه
+        await query.answer("⏹ در حال لغو...")
+        return
+
     await query.answer()
 
     if data == "mode_cover":
@@ -983,7 +1156,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "وقتی همه رو فرستادی، زیر آخرین عکس دکمه‌ی «✅ تمام» رو بزن."
         )
     elif data == "connect_done":
-        await handle_connect_done(update, context)
+        async with _user_lock(user_id):
+            await handle_connect_done(update, context)
     elif data == "connect_cancel":
         context.user_data["mode"] = None
         context.user_data["connect_images"] = []
@@ -1012,7 +1186,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "همه یکی‌یکی لینک بشن (اسم هر فایل بالای لینکش نوشته میشه)."
         )
     elif data == "bulk_done":
-        await handle_bulk_done(update, context)
+        async with _user_lock(user_id):
+            await handle_bulk_done(update, context)
     elif data == "bulk_cancel":
         context.user_data["mode"] = None
         context.user_data["bulk_files"] = []
@@ -1024,11 +1199,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None):
     status = status_msg or await msg.reply_text("در حال آپلود...")
 
-    link = await upload_catbox_with_progress(
-        filename, file_bytes, status, prefix=f"⬆️ در حال آپلود «{filename}»"
-    )
+    cancelled = False
+    try:
+        link = await upload_catbox_with_progress(
+            filename, file_bytes, status, prefix=f"⬆️ در حال آپلود «{filename}»"
+        )
+    except TaskCancelled:
+        cancelled = True
+        link = None
 
-    if link:
+    if cancelled:
+        await _safe_edit(status, "❌ آپلود لغو شد.")
+    elif link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
         await status.edit_text(
             f"✅ آپلود شد (Catbox)\nلینک مستقیم:\n<code>{link}</code>",
@@ -1046,6 +1228,12 @@ async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEF
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # فایل‌های هر کاربر یکی‌یکی (به‌ترتیب) پردازش میشن، ولی دکمه‌ی لغو آزاده
+    async with _user_lock(update.effective_user.id):
+        await _handle_file_impl(update, context)
+
+
+async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = update.effective_user.id
 
@@ -1065,7 +1253,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "cover":
         # فقط عکس قبول میشه
         if msg.photo:
-            file_obj = await msg.photo[-1].get_file()
+            file_src = msg.photo[-1]
             filename = "cover.jpg"
         else:
             await msg.reply_text("⚠️ تو حالت «آپلود کاور» فقط عکس قبول میشه. فایل دیگه‌ای نفرست.")
@@ -1081,7 +1269,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
         if is_pdf:
-            file_obj = await msg.document.get_file()
+            file_src = msg.document
             filename = msg.document.file_name or "file.pdf"
         else:
             await msg.reply_text("⚠️ تو حالت «آپلود PDF» فقط فایل PDF قبول میشه. فایل دیگه‌ای نفرست.")
@@ -1102,12 +1290,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status = await msg.reply_text("⬇️ در حال دریافت فایل زیپ...")
         try:
-            zip_file_obj = await msg.document.get_file()
             zip_bytes = await download_with_progress(
-                zip_file_obj, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل زیپ..."
+                msg.document, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل زیپ..."
             )
             await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
             pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, zip_bytes)
+        except TaskCancelled:
+            await _safe_edit(status, "❌ دریافت فایل لغو شد.")
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -1145,12 +1337,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status = await msg.reply_text("⬇️ در حال دریافت فایل رار...")
         try:
-            rar_file_obj = await msg.document.get_file()
             rar_bytes = await download_with_progress(
-                rar_file_obj, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل رار..."
+                msg.document, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل رار..."
             )
             await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
             pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, rar_bytes)
+        except TaskCancelled:
+            await _safe_edit(status, "❌ دریافت فایل لغو شد.")
+            context.user_data["mode"] = None
+            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+            return
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش رار پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -1257,10 +1453,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dl_label = msg.document.file_name or "فایل"
         status = await msg.reply_text(f"⬇️ در حال دریافت {dl_label}...")
         try:
-            file_obj = await msg.document.get_file()
             file_bytes = await download_with_progress(
-                file_obj, status, msg.document.file_size, prefix=f"⬇️ در حال دریافت {dl_label}..."
+                msg.document, status, msg.document.file_size, prefix=f"⬇️ در حال دریافت {dl_label}..."
             )
+        except TaskCancelled:
+            # فقط همین فایل لغو میشه؛ حالت گروهی فعال می‌مونه و می‌تونی فایل بعدی رو بفرستی
+            await _safe_edit(status, f"❌ دریافت {dl_label} لغو شد.")
+            return
         except Exception as e:
             await status.edit_text(f"❌ خطا توی دریافت فایل: {e}")
             return
@@ -1307,13 +1506,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
+    status = None
     try:
         status = await msg.reply_text(f"⬇️ در حال دریافت {filename}...")
         file_bytes = await download_with_progress(
-            file_obj, status, getattr(file_obj, "file_size", None),
+            file_src, status, getattr(file_src, "file_size", None),
             prefix=f"⬇️ در حال دریافت {filename}..."
         )
         await process_and_reply(msg, filename, file_bytes, context, status_msg=status)
+    except TaskCancelled:
+        if status:
+            await _safe_edit(status, "❌ دریافت فایل لغو شد.")
+        context.user_data["mode"] = None
+        await msg.reply_text(
+            "یکی از حالت‌ها رو انتخاب کن:",
+            reply_markup=main_menu()
+        )
     except Exception as e:
         # هر خطایی که پیش بیاد، ربات کرش نمی‌کنه و به کاربر اطلاع میده
         await msg.reply_text(f"❌ خطایی پیش اومد: {e}")
@@ -1351,7 +1559,15 @@ def main():
         pool_timeout=60,
     )
 
-    builder = ApplicationBuilder().token(BOT_TOKEN).request(custom_request)
+    # concurrent_updates: بدون این، تلگرام آپدیت‌ها رو یکی‌یکی پردازش می‌کنه و
+    # وقتی بات وسط آپلود/دانلود باشه، کلیکِ دکمه‌ی «❌ لغو» تا تموم شدن کار
+    # پردازش نمیشه. (ترتیب فایل‌های هر کاربر با _user_lock حفظ میشه.)
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(custom_request)
+        .concurrent_updates(True)
+    )
 
     if USE_LOCAL_BOT_API:
         print(f"✅ اتصال به Local Bot API Server: {LOCAL_BOT_API_URL}")
