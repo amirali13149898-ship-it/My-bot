@@ -2,10 +2,12 @@ import os
 import io
 import re
 import json
+import time
 import zipfile
 import threading
 import asyncio
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 import img2pdf
 import rarfile
 from PIL import Image
@@ -179,20 +181,111 @@ def run_web():
 
 CATBOX_API = "https://catbox.moe/user/api.php"
 
+PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
 
-def upload_catbox(filename, file_bytes):
+
+def _format_mb(n):
+    return f"{(n or 0) / (1024 * 1024):.1f}MB"
+
+
+def _progress_bar(done, total, width=14):
+    if not total:
+        return "░" * width
+    pct = max(0.0, min(1.0, done / total))
+    filled = int(width * pct)
+    return "▓" * filled + "░" * (width - filled)
+
+
+def upload_catbox(filename, file_bytes, progress_cb=None):
+    """
+    آپلود به Catbox. اگه progress_cb داده بشه، آپلود به‌صورت استریم (با
+    MultipartEncoderMonitor) انجام میشه و progress_cb(bytes_sent, total_bytes)
+    هر چند بار که داده واقعاً روی سوکت نوشته بشه صدا زده میشه - یعنی درصدِ
+    واقعیِ آپلوده، نه یه تخمین ساختگی.
+    """
+    total = len(file_bytes)
     try:
-        r = requests.post(
-            CATBOX_API,
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": (filename, bytes(file_bytes))},
-            timeout=60,
-        )
+        if progress_cb:
+            encoder = MultipartEncoder(fields={
+                "reqtype": "fileupload",
+                "fileToUpload": (filename, io.BytesIO(bytes(file_bytes)), "application/octet-stream"),
+            })
+
+            def _on_read(monitor):
+                progress_cb(monitor.bytes_read, total)
+
+            monitor = MultipartEncoderMonitor(encoder, _on_read)
+            r = requests.post(
+                CATBOX_API,
+                data=monitor,
+                headers={"Content-Type": monitor.content_type},
+                timeout=300,
+            )
+        else:
+            r = requests.post(
+                CATBOX_API,
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (filename, bytes(file_bytes))},
+                timeout=60,
+            )
         if r.status_code == 200 and r.text.startswith("http"):
             return r.text.strip()
     except Exception:
         pass
     return None
+
+
+async def _safe_edit(status_msg, text):
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass
+
+
+async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix=""):
+    """
+    upload_catbox رو توی یه ترد جدا اجرا می‌کنه (تا بلاک نکنه) و پیام status_msg
+    رو حداکثر هر PROGRESS_UPDATE_INTERVAL ثانیه با درصد واقعیِ آپلود آپدیت می‌کنه.
+    """
+    loop = asyncio.get_running_loop()
+    last_edit_at = 0.0
+
+    def progress_cb(done, total_bytes):
+        nonlocal last_edit_at
+        now = time.monotonic()
+        if now - last_edit_at < PROGRESS_UPDATE_INTERVAL and done < total_bytes:
+            return
+        last_edit_at = now
+        bar = _progress_bar(done, total_bytes)
+        pct = int(done * 100 / total_bytes) if total_bytes else 0
+        text = f"{prefix}\n[{bar}] {pct}%\n{_format_mb(done)} / {_format_mb(total_bytes)}"
+        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
+
+    return await asyncio.to_thread(upload_catbox, filename, file_bytes, progress_cb)
+
+
+async def download_with_progress(file_obj, status_msg, total_size, prefix="⬇️ در حال دریافت..."):
+    """
+    دانلود فایل از تلگرام رو شروع می‌کنه و هر PROGRESS_UPDATE_INTERVAL ثانیه پیام
+    وضعیت رو آپدیت می‌کنه. توجه: سرور محلی Bot API درصد پیشرفتِ لحظه‌ای رو در
+    اختیار نمی‌ذاره (دانلود از تلگرام داخل خودِ همون درخواست انجام میشه)، پس این
+    تیکر واقعیِ زمان سپری‌شده و حجم کل فایل رو نشون میده، نه درصد جعلی.
+    """
+    task = asyncio.ensure_future(file_obj.download_as_bytearray())
+    start = time.monotonic()
+    try:
+        while not task.done():
+            await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+            if task.done():
+                break
+            elapsed = int(time.monotonic() - start)
+            size_txt = _format_mb(total_size) if total_size else "نامشخص"
+            await _safe_edit(status_msg, f"{prefix}\n⏱ {elapsed} ثانیه گذشته (حجم فایل: {size_txt})")
+        return bytes(await task)
+    except Exception:
+        if not task.done():
+            task.cancel()
+        raise
 
 
 def main_menu():
@@ -752,11 +845,12 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_bytes = item["bytes"]
         kind = item["kind"]
 
+        header = f"⏳ در حال آپلود {idx} از {total}\n(فایل فعلی: {label})"
         try:
             await context.bot.edit_message_text(
                 chat_id=query.message.chat_id,
                 message_id=query.message.message_id,
-                text=f"⏳ در حال آپلود {idx} از {total}...\n(فایل فعلی: {label})"
+                text=header
             )
         except Exception:
             pass
@@ -778,7 +872,9 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upload_bytes = raw_bytes
             upload_filename = label if label.lower().endswith(".pdf") else f"{label}.pdf"
 
-        link = await asyncio.to_thread(upload_catbox, upload_filename, upload_bytes)
+        link = await upload_catbox_with_progress(
+            upload_filename, upload_bytes, query.message, prefix=header
+        )
         if link:
             results.append((label, link, None))
         else:
@@ -925,10 +1021,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
 
-async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE):
-    status = await msg.reply_text("در حال آپلود...")
+async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None):
+    status = status_msg or await msg.reply_text("در حال آپلود...")
 
-    link = await asyncio.to_thread(upload_catbox, filename, file_bytes)
+    link = await upload_catbox_with_progress(
+        filename, file_bytes, status, prefix=f"⬆️ در حال آپلود «{filename}»"
+    )
 
     if link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
@@ -1002,11 +1100,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("⚠️ تو حالت «زیپ به PDF» فقط فایل ZIP قبول میشه. فایل دیگه‌ای نفرست.")
             return
 
-        status = await msg.reply_text("در حال استخراج عکس‌ها و ساخت PDF...")
+        status = await msg.reply_text("⬇️ در حال دریافت فایل زیپ...")
         try:
             zip_file_obj = await msg.document.get_file()
-            zip_bytes = await zip_file_obj.download_as_bytearray()
-            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, bytes(zip_bytes))
+            zip_bytes = await download_with_progress(
+                zip_file_obj, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل زیپ..."
+            )
+            await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
+            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, zip_bytes)
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -1021,9 +1122,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
             return
 
-        await status.delete()
         base_name = os.path.splitext(msg.document.file_name or "converted")[0]
-        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context)
+        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
         return
 
     elif mode == "rar_to_pdf":
@@ -1043,11 +1143,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("⚠️ تو حالت «رار به PDF» فقط فایل RAR قبول میشه. فایل دیگه‌ای نفرست.")
             return
 
-        status = await msg.reply_text("در حال استخراج عکس‌ها و ساخت PDF...")
+        status = await msg.reply_text("⬇️ در حال دریافت فایل رار...")
         try:
             rar_file_obj = await msg.document.get_file()
-            rar_bytes = await rar_file_obj.download_as_bytearray()
-            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, bytes(rar_bytes))
+            rar_bytes = await download_with_progress(
+                rar_file_obj, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل رار..."
+            )
+            await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
+            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, rar_bytes)
         except Exception as e:
             await status.edit_text(f"❌ خطایی توی پردازش رار پیش اومد: {e}")
             context.user_data["mode"] = None
@@ -1062,9 +1165,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
             return
 
-        await status.delete()
         base_name = os.path.splitext(msg.document.file_name or "converted")[0]
-        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context)
+        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
+        return
         return
 
     elif mode == "connect":
@@ -1151,12 +1254,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        dl_label = msg.document.file_name or "فایل"
+        status = await msg.reply_text(f"⬇️ در حال دریافت {dl_label}...")
         try:
             file_obj = await msg.document.get_file()
-            file_bytes = bytes(await file_obj.download_as_bytearray())
+            file_bytes = await download_with_progress(
+                file_obj, status, msg.document.file_size, prefix=f"⬇️ در حال دریافت {dl_label}..."
+            )
         except Exception as e:
-            await msg.reply_text(f"❌ خطا توی دریافت فایل: {e}")
+            await status.edit_text(f"❌ خطا توی دریافت فایل: {e}")
             return
+        await status.delete()
 
         original_name = msg.document.file_name or f"file_{len(files_list) + 1:02d}"
         label = os.path.splitext(original_name)[0] or f"file_{len(files_list) + 1:02d}"
@@ -1200,8 +1308,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        file_bytes = await file_obj.download_as_bytearray()
-        await process_and_reply(msg, filename, file_bytes, context)
+        status = await msg.reply_text(f"⬇️ در حال دریافت {filename}...")
+        file_bytes = await download_with_progress(
+            file_obj, status, getattr(file_obj, "file_size", None),
+            prefix=f"⬇️ در حال دریافت {filename}..."
+        )
+        await process_and_reply(msg, filename, file_bytes, context, status_msg=status)
     except Exception as e:
         # هر خطایی که پیش بیاد، ربات کرش نمی‌کنه و به کاربر اطلاع میده
         await msg.reply_text(f"❌ خطایی پیش اومد: {e}")
