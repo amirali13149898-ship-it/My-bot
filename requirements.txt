@@ -6,3 +6,7 @@ Pillow
 img2pdf
 pypdf
 rarfile
+pillow-heif
+pillow-avif-plugin
+rawpy
+cairosvg
