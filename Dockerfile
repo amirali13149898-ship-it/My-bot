@@ -11,16 +11,32 @@ FROM alpine:3.20
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
 # پایتون + ابزارهای لازم برای نصب Pillow/img2pdf
+# + کتابخونه‌های سیستمی برای فرمت‌های اضافه‌شده:
+#   - libheif            -> عکس‌های HEIC/HEIF (آیفون)
+#   - libavif             -> عکس‌های AVIF
+#   - cairo/pango/gdk-pixbuf/fontconfig/ttf-dejavu -> رندر SVG با cairosvg
+#   - ghostscript         -> باز کردن EPS و فایل‌های قدیمی AI (پیلو خودش صداش می‌زنه)
+#   - libraw + libraw-dev -> فرمت‌های خام دوربین (CR2/CR3/NEF/ARW/DNG) با rawpy
+#   - gcc/g++/musl-dev/python3-dev/make/pkgconfig -> برای اینکه rawpy (که
+#     ویل آماده برای Alpine/musl نداره) از سورس کامپایل بشه
 RUN apk add --no-cache \
     python3 py3-pip \
     jpeg zlib libjpeg-turbo \
     libarchive \
-    ca-certificates
+    libheif \
+    libavif \
+    cairo pango gdk-pixbuf fontconfig ttf-dejavu \
+    ghostscript \
+    libraw libraw-dev \
+    ca-certificates \
+    && apk add --no-cache --virtual .build-deps \
+    gcc g++ musl-dev python3-dev make pkgconfig
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
+    && apk del .build-deps
 
 COPY bot.py .
 COPY start.sh .
