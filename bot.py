@@ -11,6 +11,7 @@ import asyncio
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 import img2pdf
+import pypdf
 import rarfile
 from PIL import Image
 from flask import Flask
@@ -190,6 +191,16 @@ CATBOX_API = "https://catbox.moe/user/api.php"
 # روی Catbox آپلود میشن.
 IMGBB_API = "https://api.imgbb.com/1/upload"
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "").strip()
+
+# ===== Imgur (فقط برای «آپلود کاور») =====
+# چون توی ایران بدون فیلترشکن باز میشه (برخلاف Catbox/ImgBB که مسدودن)،
+# این رو جایگزین ImgBB کردیم. یه اپ رایگان از
+# https://api.imgur.com/oauth2/addclient بساز (نوع: "Anonymous usage
+# without user authorization")، بعد Client ID رو توی Environment Variables
+# سرویس با اسم IMGUR_CLIENT_ID ست کن. اگه ست نشه، کاورها مثل قبل روی
+# Catbox آپلود میشن.
+IMGUR_API = "https://api.imgur.com/3/image"
+IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID", "").strip()
 
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
 
@@ -373,6 +384,49 @@ def upload_imgbb(filename, file_bytes, progress_cb=None):
     return None
 
 
+def upload_imgur(filename, file_bytes, progress_cb=None):
+    """
+    آپلود عکس به Imgur به‌صورت ناشناس (بدون نیاز به لاگین کاربر، فقط با
+    Client ID). لینک مستقیم عکس رو برمی‌گردونه یا None. مثل upload_imgbb،
+    progress_cb می‌تونه TaskCancelled پرتاب کنه تا آپلود قطع بشه.
+    """
+    try:
+        mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+        encoder = MultipartEncoder(fields={
+            "image": (filename, io.BytesIO(bytes(file_bytes)), mime),
+            "type": "file",
+        })
+        total = encoder.len
+
+        def _on_read(monitor):
+            if progress_cb:
+                progress_cb(monitor.bytes_read, total)
+
+        monitor = MultipartEncoderMonitor(encoder, _on_read)
+        r = requests.post(
+            IMGUR_API,
+            data=monitor,
+            headers={
+                "Content-Type": monitor.content_type,
+                "Authorization": f"Client-ID {IMGUR_CLIENT_ID}",
+            },
+            timeout=300,
+        )
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code == 200 and data.get("success"):
+            return data["data"]["link"]
+        # دلیل خطا (مثلاً Client ID اشتباه) توی لاگ سرور چاپ میشه
+        print(f"⚠️ Imgur خطا داد: HTTP {r.status_code} - {str(data)[:200]}")
+    except TaskCancelled:
+        raise
+    except Exception as e:
+        print(f"⚠️ Imgur آپلود نشد: {e}")
+    return None
+
+
 async def _safe_edit(status_msg, text, reply_markup=None):
     # نکته: ادیت بدون reply_markup دکمه‌های پیام رو پاک می‌کنه، برای همین
     # هر ادیتِ پیشرفت باید دکمه‌ی لغو رو دوباره بفرسته.
@@ -488,10 +542,11 @@ async def download_with_progress(file_src, status_msg, total_size, prefix="⬇�
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("📷 آپلود کاور", callback_data="mode_cover")],
-        [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
-        [InlineKeyboardButton("📦 زیپ عکس‌ها به PDF", callback_data="mode_zip")],
+        [
+            InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf"),
+            InlineKeyboardButton("🔄 تغییر فرمت به PDF", callback_data="mode_to_pdf"),
+        ],
         [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
-        [InlineKeyboardButton("🗜️ رار عکس‌ها به PDF", callback_data="mode_rar")],
         [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -561,14 +616,45 @@ def _open_archive(archive_bytes, kind):
     return rarfile.RarFile(io.BytesIO(archive_bytes))
 
 
-def _collect_images_from_archive_bytes(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
+def _classify_entry(name, raw):
     """
-    یه فایل زیپ/رار رو باز می‌کنه و همه‌ی عکس‌های داخلش رو جمع می‌کنه.
-    اگه داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه، تا max_depth سطح
-    توش هم دنبال عکس می‌گرده. هر فایلی که نه عکسه، نه آرشیوِ قابل‌بازکردن
+    نوع یه فایل داخل آرشیو رو تشخیص میده: 'image' / 'pdf' / 'zip' / 'rar' / None.
+    اول بر اساس پسوند اسم فایل. اگه پسوند شناخته‌شده نبود (یا اصلاً غلط
+    بود - مثلاً یه فایل عکس که به‌اشتباه .pdf یا بدون پسوند سیوشده)،
+    از روی محتوای واقعی بایت‌ها (امضای PDF یا اعتبارسنجی PIL) حدس می‌زنه.
+    این یعنی هر ترکیبی از عکس/PDF داخل زیپ یا رار، هر جوری که نام‌گذاری
+    شده باشه، شناسایی و تبدیل میشه.
+    """
+    lower = name.lower()
+    if lower.endswith(IMAGE_EXTENSIONS):
+        return "image"
+    if lower.endswith(".pdf"):
+        return "pdf"
+    if lower.endswith(".zip"):
+        return "zip"
+    if lower.endswith(".rar"):
+        return "rar"
+
+    # پسوند ناشناخته یا گمراه‌کننده -> از روی محتوای واقعی تشخیص بده
+    if raw[:4] == b"%PDF":
+        return "pdf"
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im.verify()
+        return "image"
+    except Exception:
+        return None
+
+
+def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
+    """
+    یه فایل زیپ/رار رو باز می‌کنه و همه‌ی عکس‌ها و PDFهای داخلش رو جمع
+    می‌کنه (فرقی نمی‌کنه همه عکس باشن، همه PDF باشن، یا قاطی). اگه
+    داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه، تا max_depth سطح توش هم
+    دنبال می‌گرده. هر فایلی که نه عکسه، نه PDF، نه آرشیوِ قابل‌بازکردن
     (یا عمقش از max_depth بیشتر شده)، به‌سادگی نادیده گرفته میشه - کل
-    عملیات به‌خاطر یه فایل غیرعکس متوقف نمیشه.
-    خروجی: لیستی از (name, raw_bytes) که هنوز مرتب نشده.
+    عملیات به‌خاطر یه فایل غیرقابل‌تشخیص متوقف نمیشه.
+    خروجی: لیستی از (name, raw_bytes, etype) که هنوز مرتب نشده.
     """
     collected = []
     try:
@@ -587,48 +673,69 @@ def _collect_images_from_archive_bytes(archive_bytes, kind, depth=1, max_depth=N
                 except Exception:
                     continue
 
-                lower = name.lower()
-                if lower.endswith(IMAGE_EXTENSIONS):
-                    collected.append((name, raw))
-                elif lower.endswith(".zip") and depth < max_depth:
+                etype = _classify_entry(name, raw)
+                if etype in ("image", "pdf"):
+                    collected.append((name, raw, etype))
+                elif etype in ("zip", "rar") and depth < max_depth:
                     collected.extend(
-                        _collect_images_from_archive_bytes(raw, "zip", depth + 1, max_depth)
+                        _collect_pdf_source_entries(raw, etype, depth + 1, max_depth)
                     )
-                elif lower.endswith(".rar") and depth < max_depth:
-                    collected.extend(
-                        _collect_images_from_archive_bytes(raw, "rar", depth + 1, max_depth)
-                    )
-                # وگرنه: نه عکسه نه آرشیو قابل بازکردن -> نادیده گرفته میشه
+                # وگرنه: نه عکسه، نه PDF، نه آرشیو قابل‌بازکردن -> نادیده گرفته میشه
     except Exception:
         return []
     return collected
 
 
 def _archive_to_pdf(archive_bytes, kind):
-    entries = _collect_images_from_archive_bytes(archive_bytes, kind)
+    """
+    همه‌ی عکس‌ها و PDFهای داخل یه آرشیو (و آرشیوهای تودرتوش) رو به
+    ترتیب اسم، توی یه PDF واحد می‌چسبونه. صفحات عکس‌ها با img2pdf (بدون
+    افت کیفیت) ساخته میشن و صفحات PDFهای داخلی عیناً (با pypdf) کپی
+    میشن. اگه هیچ عکس/PDف معتبری پیدا نشه، None برمی‌گردونه.
+    """
+    entries = _collect_pdf_source_entries(archive_bytes, kind)
     if not entries:
         return None
 
     entries.sort(key=lambda e: _natural_sort_key(e[0]))
 
-    prepared = [
-        data for data in (_to_img2pdf_bytes(raw) for _name, raw in entries)
-        if data is not None
-    ]
-    if not prepared:
+    writer = pypdf.PdfWriter()
+    any_added = False
+
+    for _name, raw, etype in entries:
+        try:
+            if etype == "image":
+                img_ready = _to_img2pdf_bytes(raw)
+                if img_ready is None:
+                    continue
+                single_page_pdf = img2pdf.convert([img_ready])
+                reader = pypdf.PdfReader(io.BytesIO(single_page_pdf))
+            else:  # pdf
+                reader = pypdf.PdfReader(io.BytesIO(raw))
+
+            for page in reader.pages:
+                writer.add_page(page)
+            any_added = True
+        except Exception:
+            # یه صفحه/فایل خراب کل عملیات رو متوقف نمی‌کنه، فقط ردش می‌کنیم
+            continue
+
+    if not any_added:
         return None
 
+    out = io.BytesIO()
     try:
-        return img2pdf.convert(prepared)
+        writer.write(out)
     except Exception:
         return None
+    return out.getvalue()
 
 
 def convert_zip_images_to_pdf(zip_bytes):
     """
-    عکس‌های داخل یه فایل زیپ (و زیپ/رارهای تودرتوی داخلش، تا ۳ سطح) رو
-    پیدا می‌کنه، به ترتیب اسم مرتب می‌کنه و توی یه PDF چندصفحه‌ای
-    می‌چسبونه. اگه هیچ عکسی پیدا نشه یا زیپ خراب باشه، None برمی‌گردونه.
+    عکس‌ها و PDFهای داخل یه فایل زیپ (و زیپ/رارهای تودرتوی داخلش، تا ۳
+    سطح) رو پیدا می‌کنه، به ترتیب اسم مرتب می‌کنه و توی یه PDF واحد
+    می‌چسبونه. اگه هیچی پیدا نشه یا زیپ خراب باشه، None برمی‌گردونه.
     """
     return _archive_to_pdf(zip_bytes, "zip")
 
@@ -639,6 +746,75 @@ def convert_rar_images_to_pdf(rar_bytes):
     تودرتوی داخلش، تا ۳ سطح).
     """
     return _archive_to_pdf(rar_bytes, "rar")
+
+
+def _detect_convert_kind(msg):
+    """
+    برای حالت «تغییر فرمت به PDF»: نوع فایل ارسالی رو تشخیص میده.
+    خروجی یکی از 'pdf' / 'zip' / 'rar' / 'image' / None (فرمت پشتیبانی‌نشده).
+    """
+    if msg.photo:
+        return "image"
+    if msg.document:
+        name = (msg.document.file_name or "").lower()
+        mime = msg.document.mime_type or ""
+        if mime == "application/pdf" or name.endswith(".pdf"):
+            return "pdf"
+        if mime in ("application/zip", "application/x-zip-compressed") or name.endswith(".zip"):
+            return "zip"
+        if mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar") or name.endswith(".rar"):
+            return "rar"
+        if mime.startswith("image/") or name.endswith(IMAGE_EXTENSIONS):
+            return "image"
+    return None
+
+
+async def _convert_to_pdf_and_upload(msg, context, kind, file_src, filename):
+    """
+    برای حالت «تغییر فرمت به PDF»: فایل رو دانلود می‌کنه، اگه لازم باشه
+    (zip/rar/image) به PDF تبدیل می‌کنه، و نتیجه رو آپلود می‌کنه. اگه از
+    قبل PDF باشه، مستقیم (بدون تبدیل) آپلود میشه.
+    """
+    label = {"zip": "زیپ", "rar": "رار", "image": "عکس", "pdf": "PDF"}[kind]
+    status = await msg.reply_text(f"⬇️ در حال دریافت فایل {label}...")
+    try:
+        raw_bytes = await download_with_progress(
+            file_src, status, getattr(file_src, "file_size", None),
+            prefix=f"⬇️ در حال دریافت فایل {label}..."
+        )
+    except TaskCancelled:
+        await _safe_edit(status, "❌ دریافت فایل لغو شد.")
+        context.user_data["mode"] = None
+        await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        return
+
+    if kind == "pdf":
+        # از قبل PDFه، نیازی به تبدیل نیست
+        await process_and_reply(msg, filename, raw_bytes, context, status_msg=status)
+        return
+
+    await status.edit_text("🛠 در حال تبدیل به PDF...")
+    try:
+        if kind == "zip":
+            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
+        elif kind == "rar":
+            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, raw_bytes)
+        else:  # image
+            pdf_bytes = await asyncio.to_thread(images_bytes_to_pdf, [(filename, raw_bytes)])
+    except Exception as e:
+        await status.edit_text(f"❌ خطایی توی تبدیل به PDF پیش اومد: {e}")
+        context.user_data["mode"] = None
+        await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        return
+
+    if pdf_bytes is None:
+        await status.edit_text("❌ هیچ عکس یا PDF معتبری توی فایل (یا آرشیوهای تودرتوش) پیدا نشد، یا فایل خراب بود.")
+        context.user_data["mode"] = None
+        await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        return
+
+    base_name = os.path.splitext(filename)[0]
+    await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
 
 
 def user_display_name(user):
@@ -1195,14 +1371,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "حالت «آپلود PDF» فعال شد ✅\nفقط فایل PDF بفرست (هر فایل دیگه‌ای رد میشه).",
             reply_markup=main_menu()
         )
-    elif data == "mode_zip":
-        context.user_data["mode"] = "zip_to_pdf"
+    elif data == "mode_to_pdf":
+        context.user_data["mode"] = "to_pdf"
         await query.edit_message_text(
-            "حالت «زیپ عکس‌ها به PDF» فعال شد ✅\n"
-            "یه فایل ZIP بفرست که توش عکس باشه؛ عکس‌ها به ترتیب اسمشون "
-            "توی یه PDF چندصفحه‌ای چسبونده میشن.\n"
-            "اگه داخل زیپ یه زیپ یا رار دیگه هم باشه (تا ۳ سطح تودرتو)، "
-            "عکس‌های اونم پیدا میشه؛ فایل‌های غیرعکس نادیده گرفته میشن.",
+            "حالت «تغییر فرمت به PDF» فعال شد ✅\n\n"
+            "هر کدوم از این‌ها رو بفرستی، خودکار تشخیص داده میشه:\n"
+            "📦 ZIP یا 🗜️ RAR (هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
+            "توی یه PDF واحد می‌چسبونیم؛ اگه توشون آرشیو دیگه‌ای هم باشه تا ۳ سطح "
+            "تودرتو دنبال محتوا می‌گردیم)\n"
+            "🖼 یه عکس تکی (به یه PDF تک‌صفحه‌ای تبدیل میشه)\n"
+            "📄 یه فایل PDF (چون از قبل PDFه، فقط مستقیم آپلود میشه)",
             reply_markup=main_menu()
         )
     elif data == "mode_connect":
@@ -1226,16 +1404,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("connect_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-    elif data == "mode_rar":
-        context.user_data["mode"] = "rar_to_pdf"
-        await query.edit_message_text(
-            "حالت «رار عکس‌ها به PDF» فعال شد ✅\n"
-            "یه فایل RAR بفرست که توش عکس باشه؛ عکس‌ها به ترتیب اسمشون "
-            "توی یه PDF چندصفحه‌ای چسبونده میشن.\n"
-            "اگه داخل رار یه زیپ یا رار دیگه هم باشه (تا ۳ سطح تودرتو)، "
-            "عکس‌های اونم پیدا میشه؛ فایل‌های غیرعکس نادیده گرفته میشن.",
-            reply_markup=main_menu()
-        )
     elif data == "mode_bulk":
         context.user_data["mode"] = "bulk_upload"
         context.user_data["bulk_files"] = []
@@ -1261,11 +1429,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None, host="catbox"):
     status = status_msg or await msg.reply_text("در حال آپلود...")
 
-    # کاورها (عکس) به ImgBB میرن؛ اگه کلیدش ست نشده باشه، Catbox
-    if host == "imgbb" and not IMGBB_API_KEY:
+    # کاورها (عکس) به Imgur میرن (چون توی ایران بدون فیلترشکن بازه)؛
+    # اگه Client ID ست نشده باشه، Catbox
+    if host == "imgur" and not IMGUR_CLIENT_ID:
         host = "catbox"
-    host_name = "ImgBB" if host == "imgbb" else "Catbox"
-    uploader = upload_imgbb if host == "imgbb" else upload_catbox
+    host_name = "Imgur" if host == "imgur" else "Catbox"
+    uploader = upload_imgur if host == "imgur" else upload_catbox
 
     cancelled = False
     try:
@@ -1344,95 +1513,22 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("⚠️ تو حالت «آپلود PDF» فقط فایل PDF قبول میشه. فایل دیگه‌ای نفرست.")
             return
 
-    elif mode == "zip_to_pdf":
-        # فقط ZIP قبول میشه
-        is_zip = (
-            msg.document
-            and (
-                msg.document.mime_type in ("application/zip", "application/x-zip-compressed")
-                or (msg.document.file_name and msg.document.file_name.lower().endswith(".zip"))
+    elif mode == "to_pdf":
+        kind = _detect_convert_kind(msg)
+        if kind is None:
+            await msg.reply_text(
+                "⚠️ تو حالت «تغییر فرمت به PDF» فقط PDF، ZIP، RAR یا عکس قبول میشه."
             )
-        )
-        if not is_zip:
-            await msg.reply_text("⚠️ تو حالت «زیپ به PDF» فقط فایل ZIP قبول میشه. فایل دیگه‌ای نفرست.")
             return
 
-        status = await msg.reply_text("⬇️ در حال دریافت فایل زیپ...")
-        try:
-            zip_bytes = await download_with_progress(
-                msg.document, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل زیپ..."
-            )
-            await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
-            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, zip_bytes)
-        except TaskCancelled:
-            await _safe_edit(status, "❌ دریافت فایل لغو شد.")
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
-        except Exception as e:
-            await status.edit_text(f"❌ خطایی توی پردازش زیپ پیش اومد: {e}")
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
+        if kind == "image":
+            file_src = msg.document if msg.document else msg.photo[-1]
+            filename = getattr(file_src, "file_name", None) or "image.jpg"
+        else:
+            file_src = msg.document
+            filename = msg.document.file_name or f"file.{kind}"
 
-        if pdf_bytes is None:
-            await status.edit_text(
-                "❌ هیچ عکسی توی فایل زیپ (یا آرشیوهای تودرتوش) پیدا نشد یا فایل زیپ خراب بود."
-            )
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
-
-        base_name = os.path.splitext(msg.document.file_name or "converted")[0]
-        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
-        return
-
-    elif mode == "rar_to_pdf":
-        # فقط RAR قبول میشه
-        is_rar = (
-            msg.document
-            and (
-                (msg.document.mime_type or "") in (
-                    "application/vnd.rar",
-                    "application/x-rar-compressed",
-                    "application/x-rar",
-                )
-                or (msg.document.file_name and msg.document.file_name.lower().endswith(".rar"))
-            )
-        )
-        if not is_rar:
-            await msg.reply_text("⚠️ تو حالت «رار به PDF» فقط فایل RAR قبول میشه. فایل دیگه‌ای نفرست.")
-            return
-
-        status = await msg.reply_text("⬇️ در حال دریافت فایل رار...")
-        try:
-            rar_bytes = await download_with_progress(
-                msg.document, status, msg.document.file_size, prefix="⬇️ در حال دریافت فایل رار..."
-            )
-            await status.edit_text("🛠 در حال استخراج عکس‌ها و ساخت PDF...")
-            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, rar_bytes)
-        except TaskCancelled:
-            await _safe_edit(status, "❌ دریافت فایل لغو شد.")
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
-        except Exception as e:
-            await status.edit_text(f"❌ خطایی توی پردازش رار پیش اومد: {e}")
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
-
-        if pdf_bytes is None:
-            await status.edit_text(
-                "❌ هیچ عکسی توی فایل رار (یا آرشیوهای تودرتوش) پیدا نشد یا فایل رار خراب بود."
-            )
-            context.user_data["mode"] = None
-            await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-            return
-
-        base_name = os.path.splitext(msg.document.file_name or "converted")[0]
-        await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
-        return
+        await _convert_to_pdf_and_upload(msg, context, kind, file_src, filename)
         return
 
     elif mode == "connect":
@@ -1619,7 +1715,10 @@ def main():
         print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
               "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
 
-    print("✅ کاورها (و بقیه‌ی فایل‌ها) روی Catbox آپلود میشن (دائمی).")
+    if IMGUR_CLIENT_ID:
+        print("✅ کاورها روی Imgur آپلود میشن (بدون فیلتر توی ایران).")
+    else:
+        print("⚠️ IMGUR_CLIENT_ID ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
 
     threading.Thread(target=run_web, daemon=True).start()
 
