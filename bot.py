@@ -674,8 +674,27 @@ def images_bytes_to_pdf(entries):
         return None
 
 
+def _sniff_archive_kind(raw):
+    """
+    نوع واقعیِ آرشیو رو از روی امضای بایت‌های اولش تشخیص میده - نه از
+    روی پسوند اسم فایل یا mime_type ای که تلگرام گزارش کرده. لازمه چون
+    خیلی از کاربرها (خصوصاً ربات‌های دیگه) یه فایل RAR رو با پسوند
+    .zip می‌فرستن (یا برعکس)، و قبلاً توی این حالت zipfile روی بایت‌های
+    RAR شکست می‌خورد و کلش «هیچی پیدا نشد» جواب می‌داد.
+    خروجی: 'zip' / 'rar' / None (اگه امضا شناخته‌شده نبود).
+    """
+    if raw[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return "zip"
+    if raw[:7] == b"Rar!\x1a\x07\x00" or raw[:8] == b"Rar!\x1a\x07\x01\x00":
+        return "rar"
+    return None
+
+
 def _open_archive(archive_bytes, kind):
-    if kind == "zip":
+    # اول بر اساس محتوای واقعی تشخیص بده؛ فقط اگه امضا ناشناخته بود از
+    # kind ای که از پسوند/mime حدس زده شده به‌عنوان fallback استفاده کن.
+    actual_kind = _sniff_archive_kind(archive_bytes) or kind
+    if actual_kind == "zip":
         return zipfile.ZipFile(io.BytesIO(archive_bytes))
     return rarfile.RarFile(io.BytesIO(archive_bytes))
 
