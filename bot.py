@@ -342,7 +342,20 @@ def upload_imgbb(filename, file_bytes, progress_cb=None):
         r = requests.post(
             IMGBB_API,
             data=monitor,
-            headers={"Content-Type": monitor.content_type},
+            headers={
+                "Content-Type": monitor.content_type,
+                # ImgBB درخواست‌های بدون User-Agent مرورگر رو گاهی به‌عنوان
+                # بات مسدود می‌کنه (خطای کد 103). این هدر رو شبیه یه
+                # مرورگر واقعی می‌فرستیم تا اون تشخیص رد بشه.
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://imgbb.com/",
+                "Origin": "https://imgbb.com",
+                "Accept": "application/json",
+            },
             timeout=300,
         )
         try:
@@ -1571,7 +1584,7 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await process_and_reply(
             msg, filename, file_bytes, context, status_msg=status,
-            host="imgbb" if mode == "cover" else "catbox"
+            host="catbox"
         )
     except TaskCancelled:
         if status:
@@ -1606,10 +1619,7 @@ def main():
         print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
               "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
 
-    if IMGBB_API_KEY:
-        print("✅ کاورها روی ImgBB آپلود میشن (دائمی).")
-    else:
-        print("⚠️ IMGBB_API_KEY ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
+    print("✅ کاورها (و بقیه‌ی فایل‌ها) روی Catbox آپلود میشن (دائمی).")
 
     threading.Thread(target=run_web, daemon=True).start()
 
