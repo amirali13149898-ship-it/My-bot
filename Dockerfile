@@ -14,7 +14,7 @@ COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-a
 RUN apk add --no-cache \
     python3 py3-pip \
     jpeg zlib libjpeg-turbo \
-    unrar \
+    libarchive \
     ca-certificates
 
 WORKDIR /app
