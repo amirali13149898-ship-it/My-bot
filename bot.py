@@ -15,6 +15,17 @@ import pypdf
 import rarfile
 from PIL import Image
 
+# rarfile برای استخراج واقعیِ محتوای RAR به یه ابزار خارجی نیاز داره
+# (خودش فقط هدرها رو می‌فهمه، دیکد نمی‌کنه). روی ایمیج آلپاینی ما
+# ابزار bsdtar (از پکیج libarchive-tools توی Dockerfile) نصبه؛ اینجا
+# صریحاً بهش می‌گیم ازش استفاده کنه تا به‌جای auto-detect (که همیشه
+# قابل‌اعتماد نیست) مطمئن باشیم درست پیدا میشه.
+import shutil
+if shutil.which("bsdtar"):
+    rarfile.UNRAR_TOOL = "bsdtar"
+else:
+    print("⚠️ ابزار bsdtar پیدا نشد؛ فایل‌های RAR ممکنه باز نشن (پکیج libarchive-tools رو چک کن).")
+
 # ===== پشتیبانی از فرمت‌های اضافه‌ی عکس =====
 # HEIC/HEIF (فرمت پیش‌فرض آیفون) و AVIF از طریق پلاگین به پیلو اضافه
 # میشن - بعد از این import‌ها، Image.open خودش این فرمت‌ها رو هم می‌فهمه.
@@ -762,7 +773,8 @@ def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_A
             for name in names:
                 try:
                     raw = af.read(name)
-                except Exception:
+                except Exception as e:
+                    print(f"⚠️ خوندن «{name}» از آرشیو شکست خورد: {e}")
                     continue
 
                 etype = _classify_entry(name, raw)
@@ -773,7 +785,8 @@ def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_A
                         _collect_pdf_source_entries(raw, etype, depth + 1, max_depth)
                     )
                 # وگرنه: نه عکسه، نه PDF، نه آرشیو قابل‌بازکردن -> نادیده گرفته میشه
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ باز کردن آرشیو (kind={kind}) شکست خورد: {e}")
         return []
     return collected
 
