@@ -1025,12 +1025,15 @@ def convert_rar_images_to_pdf(rar_bytes):
 
 
 # ==================== بخش «اصلاح و آپلود آرشیو» ====================
-# این بخش فایل رو به PDF تبدیل نمی‌کنه؛ فقط «حالت واقعیِ» آرشیو رو درست می‌کنه:
+# این بخش هر آرشیو رو اول به PDF تبدیل می‌کنه و بعد همون PDF رو آپلود می‌کنه
+# (خودِ آرشیو دیگه آپلود نمیشه):
 #   - نوع واقعی رو از روی محتوا تشخیص میده (نه پسوند): مثلاً فایلی که اسمش .zip
-#     ولی در اصل RAR هست، با پسوند درست (.rar) آپلود میشه.
+#     ولی در اصل RAR هست هم درست باز میشه.
 #   - اگه آرشیو فقط یه «پوسته» بود و توش فقط آرشیو(های) دیگه بود (زیپ توی رار،
-#     رار توی زیپ، ...)، پوسته‌ی بیرونی کنار زده میشه و آرشیوِ داخلی آپلود میشه.
-ARCHIVE_EXT = {"zip": ".zip", "rar": ".rar", "7z": ".7z"}
+#     رار توی زیپ، ...)، پوسته‌ی بیرونی کنار زده میشه و هر آرشیوِ داخلی جدا به
+#     یه PDF تبدیل میشه.
+#   - همه‌ی عکس‌ها و PDFهای داخل هر آرشیو (به ترتیب اسم) توی یه PDF واحد
+#     می‌چسبن؛ همون منطق حالت «تغییر فرمت به PDF».
 _JUNK_BASENAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
 
 
@@ -1095,21 +1098,16 @@ def _unwrap_archive(raw, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
     return results
 
 
-def _archive_out_name(original_name, item, total):
-    """اسم نهایی با پسوند درست. CBZ/CBR که واقعاً زیپ/رار باشن دست نمی‌خورن."""
-    ext = ARCHIVE_EXT.get(item["kind"], "")
+def _pdf_out_name(original_name, item, total):
+    """اسم نهایی PDF: اسم فایل اصلی (یا اسم آرشیو داخلی) با پسوند .pdf"""
     source = original_name if total == 1 else (item["name"] or original_name)
-    base, old_ext = os.path.splitext(source or "file")
-    base = base or "file"
-    if (old_ext.lower(), item["kind"]) in ((".cbz", "zip"), (".cbr", "rar")):
-        ext = old_ext
-    return f"{base}{ext}"
+    base = os.path.splitext(source or "file")[0] or "file"
+    return f"{base}.pdf"
 
 
 async def _archive_fix_and_upload(msg, context):
     doc = msg.document
     original_name = doc.file_name or "file"
-    safe_orig = html.escape(original_name)
 
     status = await msg.reply_text(f"⬇️ در حال دریافت {original_name}...")
     try:
@@ -1144,7 +1142,7 @@ async def _archive_fix_and_upload(msg, context):
     total = len(items)
     used = set()
     for item in items:
-        out = _archive_out_name(original_name, item, total)
+        out = _pdf_out_name(original_name, item, total)
         stem, ext = os.path.splitext(out)
         n = 2
         while out.lower() in used:
@@ -1157,18 +1155,53 @@ async def _archive_fix_and_upload(msg, context):
     cancelled = False
     for idx, item in enumerate(items, start=1):
         out = item["out_name"]
-        prefix = f"⬆️ در حال آپلود «{out}»" + (f" ({idx} از {total})" if total > 1 else "")
+        counter = f" ({idx} از {total})" if total > 1 else ""
+        # توی پیام‌های خطا اسم فایل مبدا رو نشون میدیم (نه اسم PDF که ساخته نشده)
+        src_label = html.escape(original_name if total == 1 else (item["name"] or original_name))
+
+        notes = []
+        if item["layers"]:
+            notes.append(f"🔓 {item['layers']} لایه‌ی آرشیو بیرونی کنار زده شد")
+
+        # ---- مرحله ۱: تبدیل به PDF ----
+        if item["kind"] == "7z":
+            # باز کردن 7z هنوز پشتیبانی نمیشه (فقط ZIP/RAR)
+            blocks.append(
+                f"❌ <b>{src_label}</b>\n"
+                "این فایل 7z بود و تبدیل 7z به PDF هنوز پشتیبانی نمیشه؛ آپلود نشد."
+            )
+            item["raw"] = None
+            continue
+
+        await _safe_edit(status, f"🛠 در حال تبدیل به PDF...{counter}")
+        pdf_bytes, stats = None, None
         try:
-            link = await upload_catbox_with_progress(out, item["raw"], status, prefix=prefix)
+            pdf_bytes, stats = await _run_heavy(_archive_to_pdf_with_stats, item["raw"], item["kind"])
+        except Exception as e:
+            print(f"⚠️ تبدیل آرشیو به PDF خطا داد ({out}): {e}")
+        item["raw"] = None  # آزاد کردن رم (آرشیو دیگه لازم نیست)
+
+        if pdf_bytes is None:
+            reason = "هیچ عکس یا PDF معتبری داخلش پیدا نشد، یا فایل خراب/رمزدار بود؛ آپلود نشد."
+            if stats and stats["bad_archives"]:
+                reason += "\n(یه آرشیو خراب یا رمزدار بود و باز نشد.)"
+            blocks.append(f"❌ <b>{src_label}</b>\n{reason}")
+            continue
+
+        desc = _describe_stats(stats)
+        if desc:
+            notes.append(desc)
+
+        # ---- مرحله ۲: آپلود PDF ----
+        prefix = f"⬆️ در حال آپلود «{out}»{counter}"
+        try:
+            link = await upload_catbox_with_progress(out, pdf_bytes, status, prefix=prefix)
         except TaskCancelled:
             cancelled = True
             break
+        finally:
+            del pdf_bytes
 
-        notes = []
-        if out != original_name and total == 1:
-            notes.append(f"🔧 نوع واقعی {item['kind'].upper()} بود؛ اسم به «{html.escape(out)}» اصلاح شد")
-        if item["layers"]:
-            notes.append(f"🔓 {item['layers']} لایه‌ی آرشیو بیرونی کنار زده شد")
         if link:
             block = f"✅ <b>{html.escape(out)}</b>\n<code>{link}</code>"
         else:
@@ -1176,7 +1209,6 @@ async def _archive_fix_and_upload(msg, context):
         if notes:
             block += "\n" + "\n".join(notes)
         blocks.append(block)
-        item["raw"] = None  # آزاد کردن رم
 
     if cancelled:
         head = "❌ آپلود لغو شد."
@@ -1871,12 +1903,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = "archive_fix"
         await query.edit_message_text(
             "حالت «اصلاح و آپلود آرشیو» فعال شد ✅\n\n"
-            "فایل ZIP / RAR / 7z (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
-            "به PDF تبدیل نمیشه؛ فقط:\n"
-            "🔧 نوع واقعی از روی محتوا تشخیص داده میشه و با پسوند درست آپلود میشه "
-            "(مثلاً زیپی که در اصل رار بوده → .rar)\n"
+            "فایل ZIP / RAR (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
+            "خودِ آرشیو آپلود نمیشه؛ اول به PDF تبدیل میشه و بعد همون PDF آپلود میشه:\n"
+            "🔧 نوع واقعی از روی محتوا تشخیص داده میشه (مثلاً زیپی که در اصل رار بوده هم باز میشه)\n"
+            "🖼 همه‌ی عکس‌ها و PDFهای داخلش به ترتیب اسم توی یه PDF می‌چسبن\n"
             "🔓 اگه آرشیو فقط یه پوسته بود (زیپ توی رار، رار توی زیپ و ...)، "
-            "پوسته‌ی بیرونی کنار زده میشه و همون آرشیو داخلی لینک میشه\n\n"
+            "پوسته‌ی بیرونی کنار زده میشه و هر آرشیو داخلی جدا به PDF تبدیل میشه\n"
+            "⚠️ فعلاً 7z پشتیبانی نمیشه\n\n"
             "می‌تونی پشت‌سرهم چند فایل بفرستی.",
             reply_markup=main_menu()
         )
