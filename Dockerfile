@@ -17,12 +17,14 @@ COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-a
 #   - cairo/pango/gdk-pixbuf/fontconfig/ttf-dejavu -> رندر SVG با cairosvg
 #   - ghostscript         -> باز کردن EPS و فایل‌های قدیمی AI (پیلو خودش صداش می‌زنه)
 #   - libraw + libraw-dev -> فرمت‌های خام دوربین (CR2/CR3/NEF/ARW/DNG) با rawpy
+#   - libarchive-tools    -> باینری bsdtar که rarfile برای استخراج واقعیِ RAR بهش نیاز داره
 #   - gcc/g++/musl-dev/python3-dev/make/pkgconfig -> برای اینکه rawpy (که
 #     ویل آماده برای Alpine/musl نداره) از سورس کامپایل بشه
 RUN apk add --no-cache \
     python3 py3-pip \
     jpeg zlib libjpeg-turbo \
     libarchive \
+    libarchive-tools \
     libheif \
     libavif \
     cairo pango gdk-pixbuf fontconfig ttf-dejavu \
