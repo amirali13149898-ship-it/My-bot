@@ -1,5 +1,6 @@
 import os
 import io
+import html
 import re
 import json
 import time
@@ -678,6 +679,7 @@ def main_menu():
         [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
         [InlineKeyboardButton("🔄 تغییر فرمت به PDF", callback_data="mode_to_pdf")],
         [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
+        [InlineKeyboardButton("🗜️ اصلاح و آپلود آرشیو", callback_data="mode_archive")],
         [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1020,6 +1022,182 @@ def convert_rar_images_to_pdf(rar_bytes):
     تودرتوی داخلش، تا ۳ سطح).
     """
     return _archive_to_pdf(rar_bytes, "rar")
+
+
+# ==================== بخش «اصلاح و آپلود آرشیو» ====================
+# این بخش فایل رو به PDF تبدیل نمی‌کنه؛ فقط «حالت واقعیِ» آرشیو رو درست می‌کنه:
+#   - نوع واقعی رو از روی محتوا تشخیص میده (نه پسوند): مثلاً فایلی که اسمش .zip
+#     ولی در اصل RAR هست، با پسوند درست (.rar) آپلود میشه.
+#   - اگه آرشیو فقط یه «پوسته» بود و توش فقط آرشیو(های) دیگه بود (زیپ توی رار،
+#     رار توی زیپ، ...)، پوسته‌ی بیرونی کنار زده میشه و آرشیوِ داخلی آپلود میشه.
+ARCHIVE_EXT = {"zip": ".zip", "rar": ".rar", "7z": ".7z"}
+_JUNK_BASENAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
+
+
+def _sniff_container(raw):
+    """'zip' / 'rar' / '7z' / None - از روی امضای بایت‌های اول فایل."""
+    kind = _sniff_archive_kind(raw)
+    if kind:
+        return kind
+    if raw[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    return None
+
+
+def _is_junk_entry(name):
+    base = os.path.basename(name)
+    return (
+        name.endswith("/")
+        or base == ""
+        or base.startswith(".")
+        or base.lower() in _JUNK_BASENAMES
+        or name.startswith("__MACOSX/")
+    )
+
+
+def _unwrap_archive(raw, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
+    """
+    اگه آرشیو «فقط پوسته» باشه (تمام محتواش خودش آرشیوه)، محتوا رو درمیاره.
+    خروجی: لیستی از دیکشنری‌های {"name", "raw", "kind", "layers"} که هر کدوم
+    یه آرشیوِ نهاییِ قابل‌آپلوده. اگه آرشیو پوسته نباشه (مثلاً عکس یا PDF
+    داخلش باشه) یا باز نشه، خودش عیناً برمی‌گرده (layers=0).
+    """
+    leaf = [{"name": None, "raw": raw, "kind": kind, "layers": 0}]
+    if kind not in ("zip", "rar") or depth > max_depth:
+        return leaf
+
+    inner = []
+    try:
+        with _open_archive(raw, kind) as af:
+            names = [n for n in af.namelist() if not _is_junk_entry(n)]
+            if not names or len(names) > 30:
+                return leaf
+            # اگه اسم حتی یه فایل عکس/PDF باشه، پوسته نیست - بدون استخراج رد شو
+            if any(n.lower().endswith(IMAGE_EXTENSIONS + (".pdf",)) for n in names):
+                return leaf
+            for n in names:
+                data = af.read(n)
+                inner_kind = _sniff_container(data)
+                if inner_kind is None:
+                    return leaf  # یه فایل غیرآرشیو هم داخلشه -> پوسته نیست
+                inner.append((os.path.basename(n), data, inner_kind))
+    except Exception as e:
+        print(f"⚠️ بررسی پوسته‌ی آرشیو (kind={kind}) شکست خورد، عیناً آپلود میشه: {e}")
+        return leaf
+
+    results = []
+    for name, data, inner_kind in inner:
+        for sub in _unwrap_archive(data, inner_kind, depth + 1, max_depth):
+            sub["layers"] += 1
+            if sub["name"] is None:
+                sub["name"] = name
+            results.append(sub)
+    return results
+
+
+def _archive_out_name(original_name, item, total):
+    """اسم نهایی با پسوند درست. CBZ/CBR که واقعاً زیپ/رار باشن دست نمی‌خورن."""
+    ext = ARCHIVE_EXT.get(item["kind"], "")
+    source = original_name if total == 1 else (item["name"] or original_name)
+    base, old_ext = os.path.splitext(source or "file")
+    base = base or "file"
+    if (old_ext.lower(), item["kind"]) in ((".cbz", "zip"), (".cbr", "rar")):
+        ext = old_ext
+    return f"{base}{ext}"
+
+
+async def _archive_fix_and_upload(msg, context):
+    doc = msg.document
+    original_name = doc.file_name or "file"
+    safe_orig = html.escape(original_name)
+
+    status = await msg.reply_text(f"⬇️ در حال دریافت {original_name}...")
+    try:
+        raw = await download_with_progress(
+            doc, status, doc.file_size, prefix=f"⬇️ در حال دریافت {original_name}..."
+        )
+    except TaskCancelled:
+        await _safe_edit(status, f"❌ دریافت {original_name} لغو شد.")
+        return
+    except Exception as e:
+        await _safe_edit(status, f"❌ خطا توی دریافت فایل: {e}")
+        return
+
+    kind = _sniff_container(raw)
+    if kind is None:
+        await _safe_edit(
+            status,
+            "⚠️ این فایل نه ZIP/RAR/7z تشخیص داده شد، نه شبیه آرشیوه؛ آپلود نشد.\n"
+            "(برای PDF و عکس از حالت‌های خودشون استفاده کن.)",
+        )
+        return
+
+    await _safe_edit(status, "🔍 در حال بررسی نوع واقعی فایل...")
+    try:
+        items = await _run_heavy(_unwrap_archive, raw, kind)
+    except Exception as e:
+        print(f"⚠️ _unwrap_archive خطا داد: {e}")
+        items = [{"name": None, "raw": raw, "kind": kind, "layers": 0}]
+    del raw
+
+    # اسم‌های نهایی (یکتا)
+    total = len(items)
+    used = set()
+    for item in items:
+        out = _archive_out_name(original_name, item, total)
+        stem, ext = os.path.splitext(out)
+        n = 2
+        while out.lower() in used:
+            out = f"{stem}_{n}{ext}"
+            n += 1
+        used.add(out.lower())
+        item["out_name"] = out
+
+    blocks = []
+    cancelled = False
+    for idx, item in enumerate(items, start=1):
+        out = item["out_name"]
+        prefix = f"⬆️ در حال آپلود «{out}»" + (f" ({idx} از {total})" if total > 1 else "")
+        try:
+            link = await upload_catbox_with_progress(out, item["raw"], status, prefix=prefix)
+        except TaskCancelled:
+            cancelled = True
+            break
+
+        notes = []
+        if out != original_name and total == 1:
+            notes.append(f"🔧 نوع واقعی {item['kind'].upper()} بود؛ اسم به «{html.escape(out)}» اصلاح شد")
+        if item["layers"]:
+            notes.append(f"🔓 {item['layers']} لایه‌ی آرشیو بیرونی کنار زده شد")
+        if link:
+            block = f"✅ <b>{html.escape(out)}</b>\n<code>{link}</code>"
+        else:
+            block = f"❌ <b>{html.escape(out)}</b>\nآپلود ناموفق بود (بعد از چند بار تلاش)."
+        if notes:
+            block += "\n" + "\n".join(notes)
+        blocks.append(block)
+        item["raw"] = None  # آزاد کردن رم
+
+    if cancelled:
+        head = "❌ آپلود لغو شد."
+        text = head + ("\n\n" + "\n\n".join(blocks) if blocks else "")
+    else:
+        text = "\n\n".join(blocks)
+
+    try:
+        await status.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await msg.reply_text(text, parse_mode="HTML")
+
+    # حالت فعال می‌مونه تا بشه پشت‌سرهم فایل فرستاد
+    await msg.reply_text(
+        "فایل بعدی رو بفرست، یا برای برگشت:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="mode_menu")]
+        ]),
+    )
+
+# ==================== پایان بخش اصلاح و آپلود آرشیو ====================
 
 
 def _detect_convert_kind(msg):
@@ -1689,6 +1867,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("connect_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+    elif data == "mode_archive":
+        context.user_data["mode"] = "archive_fix"
+        await query.edit_message_text(
+            "حالت «اصلاح و آپلود آرشیو» فعال شد ✅\n\n"
+            "فایل ZIP / RAR / 7z (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
+            "به PDF تبدیل نمیشه؛ فقط:\n"
+            "🔧 نوع واقعی از روی محتوا تشخیص داده میشه و با پسوند درست آپلود میشه "
+            "(مثلاً زیپی که در اصل رار بوده → .rar)\n"
+            "🔓 اگه آرشیو فقط یه پوسته بود (زیپ توی رار، رار توی زیپ و ...)، "
+            "پوسته‌ی بیرونی کنار زده میشه و همون آرشیو داخلی لینک میشه\n\n"
+            "می‌تونی پشت‌سرهم چند فایل بفرستی.",
+            reply_markup=main_menu()
+        )
+    elif data == "mode_menu":
+        context.user_data["mode"] = None
+        await query.edit_message_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
     elif data == "mode_bulk":
         context.user_data["mode"] = "bulk_upload"
         context.user_data["bulk_files"] = []
@@ -1875,6 +2069,15 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent = await msg.reply_text(status_text, reply_markup=keyboard)
             context.user_data["connect_status_msg_id"] = sent.message_id
 
+        return
+
+    elif mode == "archive_fix":
+        if not msg.document:
+            await msg.reply_text(
+                "⚠️ تو حالت «اصلاح و آپلود آرشیو» فایل رو به‌صورت Document بفرست (نه عکس)."
+            )
+            return
+        await _archive_fix_and_upload(msg, context)
         return
 
     elif mode == "bulk_upload":
