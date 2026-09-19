@@ -117,33 +117,59 @@ def load_users():
     return {}
 
 
-def save_users(users):
-    if USE_SUPABASE:
-        try:
-            r = requests.post(
-                f"{SUPABASE_URL}/rest/v1/bot_kv",
-                headers={
-                    "apikey": SUPABASE_KEY,
-                    "Authorization": f"Bearer {SUPABASE_KEY}",
-                    "Content-Type": "application/json",
-                    # merge-duplicates یعنی اگه ردیف با همین key وجود داشت
-                    # آپدیت بشه (upsert) نه اینکه خطای تکراری بده
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
-                json=[{"key": SUPABASE_ROW_KEY, "value": users}],
-                timeout=15,
-            )
-            r.raise_for_status()
-        except Exception as e:
-            print(f"⚠️ ذخیره در Supabase با خطا مواجه شد: {e}")
-        return
+_SAVE_LOCK = threading.Lock()
+_save_seq = 0          # شماره‌ی آخرین درخواست ذخیره (فقط از ترد اصلی افزایش پیدا می‌کنه)
+_last_written_seq = 0  # شماره‌ی آخرین ذخیره‌ای که واقعاً نوشته شده
 
-    # حالت پشتیبان: فایل محلی (روی رندر رایگان دائمی نیست!)
-    try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ ذخیره فایل کاربران با خطا مواجه شد: {e}")
+
+def _write_users(snapshot, seq):
+    global _last_written_seq
+    with _SAVE_LOCK:
+        if seq < _last_written_seq:
+            return  # یه ذخیره‌ی جدیدتر قبلاً نوشته شده؛ این نسخه‌ی قدیمی رو دوباره ننویس
+        _last_written_seq = seq
+
+        if USE_SUPABASE:
+            try:
+                r = requests.post(
+                    f"{SUPABASE_URL}/rest/v1/bot_kv",
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                        # merge-duplicates یعنی اگه ردیف با همین key وجود داشت
+                        # آپدیت بشه (upsert) نه اینکه خطای تکراری بده
+                        "Prefer": "resolution=merge-duplicates,return=minimal",
+                    },
+                    json=[{"key": SUPABASE_ROW_KEY, "value": snapshot}],
+                    timeout=15,
+                )
+                r.raise_for_status()
+            except Exception as e:
+                print(f"⚠️ ذخیره در Supabase با خطا مواجه شد: {e}")
+            return
+
+        # حالت پشتیبان: فایل محلی (روی رندر رایگان دائمی نیست!)
+        try:
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ ذخیره فایل کاربران با خطا مواجه شد: {e}")
+
+
+def save_users(users):
+    """
+    قبلاً این تابع همون لحظه و توی ترد اصلیِ ربات به Supabase درخواست می‌زد
+    (تا ۱۵ ثانیه)؛ یعنی هر بار که یه ادمین کاربری رو تایید/رد می‌کرد یا
+    /start می‌زد، کل ربات (نوار پیشرفتِ آپلودِ بقیه‌ی ادمین‌ها هم) همین‌قدر
+    یخ می‌زد. حالا از داده یه عکس‌فوری (snapshot) می‌گیریم و نوشتنش رو توی
+    یه ترد جدا انجام میدیم؛ ترتیب نوشتن هم با شماره‌ی توالی حفظ میشه تا
+    یه نسخه‌ی قدیمی روی نسخه‌ی جدیدتر نوشته نشه.
+    """
+    global _save_seq
+    _save_seq += 1
+    snapshot = json.loads(json.dumps(users, ensure_ascii=False))
+    threading.Thread(target=_write_users, args=(snapshot, _save_seq), daemon=True).start()
 
 
 # {user_id_str: {first_name, username, allowed, is_admin}}
@@ -229,6 +255,33 @@ IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID", "").strip()
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
 
 
+# ===== کنترل همزمانی (مهم وقتی چند ادمین با هم کار می‌کنن) =====
+# Catbox اگه از یه IP چندتا آپلود سنگین همزمان بگیره (اینجا: IP سرور Render)
+# اتصال‌ها رو قطع/محدود می‌کنه، و رم ۵۱۲ مگی هم با چندتا تبدیل PDF همزمان
+# پر میشه. برای همین آپلودها و تبدیل‌ها یه صف مشترک دارن. با Environment
+# Variable قابل تنظیمه (CATBOX_MAX_CONCURRENT / CONVERT_MAX_CONCURRENT).
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+CATBOX_MAX_CONCURRENT = _env_int("CATBOX_MAX_CONCURRENT", 2)
+CONVERT_MAX_CONCURRENT = _env_int("CONVERT_MAX_CONCURRENT", 1)
+UPLOAD_RETRIES = 3  # هر آپلود تا ۳ بار تلاش میشه
+TELEGRAM_FILE_TIMEOUT = 900  # ثانیه - سقف انتظار برای get_file فایل‌های حجیم
+
+_UPLOAD_SEM = asyncio.Semaphore(CATBOX_MAX_CONCURRENT)
+_CONVERT_SEM = asyncio.Semaphore(CONVERT_MAX_CONCURRENT)
+
+
+async def _run_heavy(func, *args):
+    """کارهای سنگین (ساخت PDF) رو توی صف مشترک و توی ترد جدا اجرا می‌کنه."""
+    async with _CONVERT_SEM:
+        return await asyncio.to_thread(func, *args)
+
+
 # ===== مدیریت عملیات‌های در حال اجرا (برای دکمه‌ی «❌ لغو») =====
 # هر دانلود/آپلود یه task_id کوتاه می‌گیره. دکمه‌ی لغو همین id رو توی
 # callback_data می‌بره و button_handler با اون، عملیات درست رو متوقف می‌کنه.
@@ -312,6 +365,32 @@ def _build_upload_text(prefix, done, total, speed):
     return "\n".join(lines)
 
 
+def _catbox_post(filename, file_bytes, progress_cb):
+    if progress_cb:
+        encoder = MultipartEncoder(fields={
+            "reqtype": "fileupload",
+            "fileToUpload": (filename, io.BytesIO(bytes(file_bytes)), "application/octet-stream"),
+        })
+        total = encoder.len  # حجم کل بدنه‌ی درخواست (فایل + هدرهای multipart)
+
+        def _on_read(monitor):
+            progress_cb(monitor.bytes_read, total)
+
+        monitor = MultipartEncoderMonitor(encoder, _on_read)
+        return requests.post(
+            CATBOX_API,
+            data=monitor,
+            headers={"Content-Type": monitor.content_type},
+            timeout=300,
+        )
+    return requests.post(
+        CATBOX_API,
+        data={"reqtype": "fileupload"},
+        files={"fileToUpload": (filename, bytes(file_bytes))},
+        timeout=60,
+    )
+
+
 def upload_catbox(filename, file_bytes, progress_cb=None):
     """
     آپلود به Catbox. اگه progress_cb داده بشه، آپلود به‌صورت استریم (با
@@ -320,38 +399,35 @@ def upload_catbox(filename, file_bytes, progress_cb=None):
     واقعیِ آپلوده، نه یه تخمین ساختگی.
 
     progress_cb می‌تونه TaskCancelled پرتاب کنه تا آپلود وسط کار قطع بشه.
+
+    اگه Catbox خطای موقتی بده (قطع اتصال، ۵xx، ۴۲۹ و ...) تا UPLOAD_RETRIES
+    بار با فاصله‌ی زمانی دوباره تلاش میشه، و دلیل واقعیِ هر شکست توی لاگ
+    چاپ میشه (قبلاً همه‌ی خطاها بی‌صدا بلعیده می‌شدن).
     """
-    try:
-        if progress_cb:
-            encoder = MultipartEncoder(fields={
-                "reqtype": "fileupload",
-                "fileToUpload": (filename, io.BytesIO(bytes(file_bytes)), "application/octet-stream"),
-            })
-            total = encoder.len  # حجم کل بدنه‌ی درخواست (فایل + هدرهای multipart)
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        wait = 3 * attempt
+        try:
+            r = _catbox_post(filename, file_bytes, progress_cb)
+            text = (r.text or "").strip()
+            if r.status_code == 200 and text.startswith("http"):
+                return text
+            reason = f"HTTP {r.status_code}: {text[:150]}"
+            if r.status_code in (400, 401, 403, 413):
+                # خطای قطعیِ سمت درخواست - تکرارش فایده ای نداره
+                print(f"⚠️ Catbox رد کرد (بدون تلاش مجدد): {reason}")
+                return None
+            try:
+                wait = min(30, max(wait, int(r.headers.get("Retry-After", 0))))
+            except (TypeError, ValueError):
+                pass
+        except TaskCancelled:
+            raise
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
 
-            def _on_read(monitor):
-                progress_cb(monitor.bytes_read, total)
-
-            monitor = MultipartEncoderMonitor(encoder, _on_read)
-            r = requests.post(
-                CATBOX_API,
-                data=monitor,
-                headers={"Content-Type": monitor.content_type},
-                timeout=300,
-            )
-        else:
-            r = requests.post(
-                CATBOX_API,
-                data={"reqtype": "fileupload"},
-                files={"fileToUpload": (filename, bytes(file_bytes))},
-                timeout=60,
-            )
-        if r.status_code == 200 and r.text.startswith("http"):
-            return r.text.strip()
-    except TaskCancelled:
-        raise
-    except Exception:
-        pass
+        print(f"⚠️ Catbox تلاش {attempt}/{UPLOAD_RETRIES} ناموفق بود ({filename}): {reason}")
+        if attempt < UPLOAD_RETRIES:
+            time.sleep(wait)
     return None
 
 
@@ -466,6 +542,9 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
     رو حداکثر هر PROGRESS_UPDATE_INTERVAL ثانیه با درصد واقعیِ آپلود، حجم،
     سرعت و زمان باقی‌مانده آپدیت می‌کنه. زیر پیام دکمه‌ی «❌ لغو» هست.
 
+    اگه چند نفر همزمان آپلود کنن، آپلودها توی یه صف مشترک (حداکثر
+    CATBOX_MAX_CONCURRENT تا همزمان) میرن و به کاربر «در صف» نشون داده میشه.
+
     اگه task_id داده نشه، خودش یه عملیات جدید می‌سازه (و تهش پاکش می‌کنه).
     اگه کاربر لغو کنه TaskCancelled پرتاب میشه.
     """
@@ -475,38 +554,62 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
     state = _TASKS[task_id]
     kb = cancel_keyboard(task_id)
 
-    loop = asyncio.get_running_loop()
-    total_size = len(file_bytes)
-    start = time.monotonic()
-    tracker = {"edit_at": 0.0, "t": start, "done": 0, "speed": 0.0}
-
-    # همون لحظه‌ی شروع، دکمه‌ی لغو رو نشون بده (نه بعد از اولین ۲ ثانیه)
-    await _safe_edit(status_msg, _build_upload_text(prefix, 0, total_size or 1, 0.0), kb)
-
-    def progress_cb(done, total_bytes):
-        if state["cancelled"]:
-            raise TaskCancelled()
-        now = time.monotonic()
-        if now - tracker["edit_at"] < PROGRESS_UPDATE_INTERVAL and done < total_bytes:
-            return
-        dt = now - tracker["t"]
-        if dt >= 0.5:
-            inst = (done - tracker["done"]) / dt
-            # میانگین‌گیری نمایی تا سرعت و ETA مدام نپره
-            tracker["speed"] = inst if tracker["speed"] == 0 else 0.6 * tracker["speed"] + 0.4 * inst
-            tracker["t"], tracker["done"] = now, done
-        elif tracker["speed"] == 0 and now - start >= 0.2 and done > 0:
-            # آپلودهای خیلی سریع: هنوز نمونه‌ی کافی نداریم، میانگین کل رو نشون بده
-            tracker["speed"] = done / (now - start)
-        tracker["edit_at"] = now
-        text = _build_upload_text(prefix, done, total_bytes, tracker["speed"])
-        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text, kb), loop)
-
     try:
-        link = await asyncio.to_thread(uploader or upload_catbox, filename, file_bytes, progress_cb)
-        if state["cancelled"] and not link:
-            raise TaskCancelled()
-        return link
+        # ---- صف مشترک بین همه‌ی کاربرها ----
+        if _UPLOAD_SEM.locked():
+            await _safe_edit(
+                status_msg,
+                f"{prefix}\n⏳ در صف آپلود... (الان چند آپلود همزمان در جریانه، نوبتت که شد خودکار شروع میشه)",
+                kb,
+            )
+        acquire = asyncio.ensure_future(_UPLOAD_SEM.acquire())
+        state["task"] = acquire  # دکمه‌ی لغو همین رو قطع می‌کنه
+        try:
+            await acquire
+        except asyncio.CancelledError:
+            if state["cancelled"]:
+                raise TaskCancelled()
+            raise
+        finally:
+            state["task"] = None
+
+        try:
+            loop = asyncio.get_running_loop()
+            total_size = len(file_bytes)
+            start = time.monotonic()
+            tracker = {"edit_at": 0.0, "t": start, "done": 0, "speed": 0.0}
+
+            # همون لحظه‌ی شروع، دکمه‌ی لغو رو نشون بده (نه بعد از اولین ۲ ثانیه)
+            await _safe_edit(status_msg, _build_upload_text(prefix, 0, total_size or 1, 0.0), kb)
+
+            def progress_cb(done, total_bytes):
+                if state["cancelled"]:
+                    raise TaskCancelled()
+                now = time.monotonic()
+                if done < tracker["done"]:
+                    # تلاش مجدد (retry) از اول شروع شده: آمار سرعت رو ریست کن
+                    tracker["t"], tracker["done"], tracker["speed"] = now, 0, 0.0
+                if now - tracker["edit_at"] < PROGRESS_UPDATE_INTERVAL and done < total_bytes:
+                    return
+                dt = now - tracker["t"]
+                if dt >= 0.5:
+                    inst = (done - tracker["done"]) / dt
+                    # میانگین‌گیری نمایی تا سرعت و ETA مدام نپره
+                    tracker["speed"] = inst if tracker["speed"] == 0 else 0.6 * tracker["speed"] + 0.4 * inst
+                    tracker["t"], tracker["done"] = now, done
+                elif tracker["speed"] == 0 and now - start >= 0.2 and done > 0:
+                    # آپلودهای خیلی سریع: هنوز نمونه‌ی کافی نداریم، میانگین کل رو نشون بده
+                    tracker["speed"] = done / (now - start)
+                tracker["edit_at"] = now
+                text = _build_upload_text(prefix, done, total_bytes, tracker["speed"])
+                asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text, kb), loop)
+
+            link = await asyncio.to_thread(uploader or upload_catbox, filename, file_bytes, progress_cb)
+            if state["cancelled"] and not link:
+                raise TaskCancelled()
+            return link
+        finally:
+            _UPLOAD_SEM.release()
     finally:
         if owns_task:
             _end_task(task_id)
@@ -530,7 +633,13 @@ async def download_with_progress(file_src, status_msg, total_size, prefix="⬇�
     size_txt = _format_mb(total_size) if total_size else "نامشخص"
 
     async def _work():
-        file_obj = await file_src.get_file()
+        # get_file روی Local Bot API تا تموم شدن دانلود از تلگرام منتظر می‌مونه؛
+        # timeout پیش‌فرض (۱۲۰ ثانیه) برای فایل‌های حجیم یا وقتی چند نفر همزمان
+        # دانلود می‌کنن کمه.
+        file_obj = await file_src.get_file(
+            read_timeout=TELEGRAM_FILE_TIMEOUT,
+            pool_timeout=TELEGRAM_FILE_TIMEOUT,
+        )
         return bytes(await file_obj.download_as_bytearray())
 
     work = asyncio.ensure_future(_work())
@@ -724,14 +833,18 @@ def _classify_entry(name, raw):
         return "image"
     if lower.endswith(".pdf"):
         return "pdf"
-    if lower.endswith(".zip"):
+    if lower.endswith((".zip", ".cbz")):
         return "zip"
-    if lower.endswith(".rar"):
+    if lower.endswith((".rar", ".cbr")):
         return "rar"
 
     # پسوند ناشناخته یا گمراه‌کننده -> از روی محتوای واقعی تشخیص بده
     if raw[:4] == b"%PDF":
         return "pdf"
+    # آرشیوی که پسوندش پاک شده یا اسمش چیز دیگه‌ایه (مثلاً «part1» یا «data.bin»)
+    archive_kind = _sniff_archive_kind(raw)
+    if archive_kind:
+        return archive_kind
     if _looks_like_svg(raw):
         return "image"
     try:
@@ -749,16 +862,30 @@ def _classify_entry(name, raw):
         return None
 
 
-def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH):
+def _new_stats():
+    return {"images": 0, "pdfs": 0, "pages": 0, "nested": 0,
+            "ignored": 0, "bad_images": 0, "bad_archives": 0}
+
+
+def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH,
+                                prefix="", stats=None):
     """
     یه فایل زیپ/رار رو باز می‌کنه و همه‌ی عکس‌ها و PDFهای داخلش رو جمع
     می‌کنه (فرقی نمی‌کنه همه عکس باشن، همه PDF باشن، یا قاطی). اگه
-    داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه، تا max_depth سطح توش هم
-    دنبال می‌گرده. هر فایلی که نه عکسه، نه PDF، نه آرشیوِ قابل‌بازکردن
+    داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه - حتی اگه پسوندش عوض شده
+    باشه - «پوسته‌ی بیرونی رو کنار می‌زنه» و تا max_depth سطح توش هم
+    دنبال محتوا می‌گرده. هر فایلی که نه عکسه، نه PDF، نه آرشیوِ قابل‌بازکردن
     (یا عمقش از max_depth بیشتر شده)، به‌سادگی نادیده گرفته میشه - کل
     عملیات به‌خاطر یه فایل غیرقابل‌تشخیص متوقف نمیشه.
+
+    prefix: مسیر آرشیوهای بیرونی. اسم فایل‌های داخلی با این پیشوند ذخیره
+    میشن (مثلاً «ch2.rar/01.jpg») تا مرتب‌سازی نهایی، عکس‌های هر آرشیوِ
+    داخلی رو کنار هم نگه داره و 01.jpg از دو رار مختلف قاطی نشه.
+
     خروجی: لیستی از (name, raw_bytes, etype) که هنوز مرتب نشده.
     """
+    if stats is None:
+        stats = _new_stats()
     collected = []
     try:
         with _open_archive(archive_bytes, kind) as af:
@@ -775,30 +902,42 @@ def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_A
                     raw = af.read(name)
                 except Exception as e:
                     print(f"⚠️ خوندن «{name}» از آرشیو شکست خورد: {e}")
+                    stats["bad_archives"] += 1
                     continue
 
+                full_name = f"{prefix}{name}"
                 etype = _classify_entry(name, raw)
                 if etype in ("image", "pdf"):
-                    collected.append((name, raw, etype))
+                    collected.append((full_name, raw, etype))
                 elif etype in ("zip", "rar") and depth < max_depth:
+                    stats["nested"] += 1
                     collected.extend(
-                        _collect_pdf_source_entries(raw, etype, depth + 1, max_depth)
+                        _collect_pdf_source_entries(
+                            raw, etype, depth + 1, max_depth,
+                            prefix=f"{full_name}/", stats=stats,
+                        )
                     )
-                # وگرنه: نه عکسه، نه PDF، نه آرشیو قابل‌بازکردن -> نادیده گرفته میشه
+                else:
+                    # نه عکسه، نه PDF، نه آرشیو قابل‌بازکردن -> نادیده گرفته میشه
+                    stats["ignored"] += 1
     except Exception as e:
         print(f"⚠️ باز کردن آرشیو (kind={kind}) شکست خورد: {e}")
+        stats["bad_archives"] += 1
         return []
     return collected
 
 
-def _archive_to_pdf(archive_bytes, kind):
+def _archive_to_pdf(archive_bytes, kind, stats=None):
     """
     همه‌ی عکس‌ها و PDFهای داخل یه آرشیو (و آرشیوهای تودرتوش) رو به
     ترتیب اسم، توی یه PDF واحد می‌چسبونه. صفحات عکس‌ها با img2pdf (بدون
     افت کیفیت) ساخته میشن و صفحات PDFهای داخلی عیناً (با pypdf) کپی
-    میشن. اگه هیچ عکس/PDف معتبری پیدا نشه، None برمی‌گردونه.
+    میشن. اگه هیچ عکس/PDF معتبری پیدا نشه، None برمی‌گردونه.
+    اگه stats (دیکشنری) داده بشه، آمار کار توش پر میشه.
     """
-    entries = _collect_pdf_source_entries(archive_bytes, kind)
+    if stats is None:
+        stats = _new_stats()
+    entries = _collect_pdf_source_entries(archive_bytes, kind, stats=stats)
     if not entries:
         return None
 
@@ -812,6 +951,7 @@ def _archive_to_pdf(archive_bytes, kind):
             if etype == "image":
                 img_ready = _to_img2pdf_bytes(raw)
                 if img_ready is None:
+                    stats["bad_images"] += 1
                     continue
                 single_page_pdf = img2pdf.convert([img_ready])
                 reader = pypdf.PdfReader(io.BytesIO(single_page_pdf))
@@ -820,20 +960,49 @@ def _archive_to_pdf(archive_bytes, kind):
 
             for page in reader.pages:
                 writer.add_page(page)
+            stats["images" if etype == "image" else "pdfs"] += 1
             any_added = True
         except Exception:
             # یه صفحه/فایل خراب کل عملیات رو متوقف نمی‌کنه، فقط ردش می‌کنیم
+            stats["bad_images"] += 1
             continue
 
     if not any_added:
         return None
 
+    stats["pages"] = len(writer.pages)
     out = io.BytesIO()
     try:
         writer.write(out)
     except Exception:
         return None
     return out.getvalue()
+
+
+def _archive_to_pdf_with_stats(archive_bytes, kind):
+    """(pdf_bytes یا None, stats) - برای اینکه به کاربر بگیم داخل فایل چی بود."""
+    stats = _new_stats()
+    return _archive_to_pdf(archive_bytes, kind, stats), stats
+
+
+def _describe_stats(stats):
+    """یه توضیح کوتاه از اینکه داخل آرشیو چی پیدا و تبدیل شد."""
+    lines = []
+    if stats["nested"]:
+        lines.append(f"🔓 داخل فایل {stats['nested']} آرشیو دیگه (زیپ/رار) بود؛ بازشون کردم")
+    content = []
+    if stats["images"]:
+        content.append(f"{stats['images']} عکس")
+    if stats["pdfs"]:
+        content.append(f"{stats['pdfs']} PDF")
+    if content:
+        lines.append(f"🖼 {' + '.join(content)} → یه PDF با {stats['pages']} صفحه")
+    skipped = stats["bad_images"] + stats["bad_archives"]
+    if skipped:
+        lines.append(f"⚠️ {skipped} مورد خراب/رمزدار بود و ردش کردم")
+    if stats["ignored"]:
+        lines.append(f"ℹ️ {stats['ignored']} فایل غیرعکس/غیرPDF نادیده گرفته شد")
+    return "\n".join(lines)
 
 
 def convert_zip_images_to_pdf(zip_bytes):
@@ -865,9 +1034,9 @@ def _detect_convert_kind(msg):
         mime = msg.document.mime_type or ""
         if mime == "application/pdf" or name.endswith(".pdf"):
             return "pdf"
-        if mime in ("application/zip", "application/x-zip-compressed") or name.endswith(".zip"):
+        if mime in ("application/zip", "application/x-zip-compressed") or name.endswith((".zip", ".cbz")):
             return "zip"
-        if mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar") or name.endswith(".rar"):
+        if mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar") or name.endswith((".rar", ".cbr")):
             return "rar"
         if mime.startswith("image/") or name.endswith(IMAGE_EXTENSIONS):
             return "image"
@@ -899,17 +1068,20 @@ async def _convert_to_pdf_and_upload(msg, context, kind, file_src, filename):
         return
 
     await status.edit_text("🛠 در حال تبدیل به PDF...")
+    note = None
+    stats = None
     try:
-        if kind == "zip":
-            pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
-        elif kind == "rar":
-            pdf_bytes = await asyncio.to_thread(convert_rar_images_to_pdf, raw_bytes)
+        if kind in ("zip", "rar"):
+            # پسوند/نوع اعلام‌شده فقط یه حدسه؛ نوع واقعیِ آرشیو (و آرشیوهای
+            # تودرتوش) داخل خودِ تابع از روی محتوا تشخیص داده میشه.
+            pdf_bytes, stats = await _run_heavy(_archive_to_pdf_with_stats, raw_bytes, kind)
+            note = _describe_stats(stats)
         elif raw_bytes[:4] == b"%PDF":
             # خیلی از فایل‌های .ai جدید در واقع یه PDF معتبرن (نسخه‌ی
             # PDF-compatible ایلوستریتور) - نیازی به تبدیل نیست، مستقیم پاس داده میشه
             pdf_bytes = raw_bytes
         else:  # image (شامل عکس معمولی، HEIC/AVIF، SVG، RAW، یا AI/EPS قدیمی)
-            pdf_bytes = await asyncio.to_thread(images_bytes_to_pdf, [(filename, raw_bytes)])
+            pdf_bytes = await _run_heavy(images_bytes_to_pdf, [(filename, raw_bytes)])
     except Exception as e:
         await status.edit_text(f"❌ خطایی توی تبدیل به PDF پیش اومد: {e}")
         context.user_data["mode"] = None
@@ -917,13 +1089,16 @@ async def _convert_to_pdf_and_upload(msg, context, kind, file_src, filename):
         return
 
     if pdf_bytes is None:
-        await status.edit_text("❌ هیچ عکس یا PDF معتبری توی فایل (یا آرشیوهای تودرتوش) پیدا نشد، یا فایل خراب بود.")
+        msg_text = "❌ هیچ عکس یا PDF معتبری توی فایل (یا آرشیوهای تودرتوش) پیدا نشد، یا فایل خراب بود."
+        if stats and stats["bad_archives"]:
+            msg_text += "\n(یه آرشیو خراب یا رمزدار بود و باز نشد.)"
+        await status.edit_text(msg_text)
         context.user_data["mode"] = None
         await msg.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
         return
 
     base_name = os.path.splitext(filename)[0]
-    await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status)
+    await process_and_reply(msg, f"{base_name}.pdf", pdf_bytes, context, status_msg=status, note=note)
 
 
 def user_display_name(user):
@@ -1288,7 +1463,7 @@ async def handle_connect_done(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(f"⏳ در حال ساخت PDF از {len(images_list)} عکس...")
 
     sorted_entries = sorted(images_list, key=lambda entry: _natural_sort_key(entry[0]))
-    pdf_bytes = await asyncio.to_thread(images_bytes_to_pdf, sorted_entries)
+    pdf_bytes = await _run_heavy(images_bytes_to_pdf, sorted_entries)
 
     context.user_data["mode"] = None
     context.user_data["connect_images"] = []
@@ -1353,7 +1528,7 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if kind == "zip":
                 try:
-                    pdf_bytes = await asyncio.to_thread(convert_zip_images_to_pdf, raw_bytes)
+                    pdf_bytes = await _run_heavy(convert_zip_images_to_pdf, raw_bytes)
                 except Exception as e:
                     results.append((label, None, f"خطا در تبدیل زیپ: {e}"))
                     continue
@@ -1485,9 +1660,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "حالت «تغییر فرمت به PDF» فعال شد ✅\n\n"
             "هر کدوم از این‌ها رو بفرستی، خودکار تشخیص داده میشه:\n"
-            "📦 ZIP یا 🗜️ RAR (هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
-            "توی یه PDF واحد می‌چسبونیم؛ اگه توشون آرشیو دیگه‌ای هم باشه تا ۳ سطح "
-            "تودرتو دنبال محتوا می‌گردیم)\n"
+            "📦 ZIP یا 🗜️ RAR (یا CBZ/CBR) — هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
+            "توی یه PDF واحد می‌چسبونیم. اگه داخل زیپ یه رار باشه (یا برعکس) "
+            "پوسته‌ی بیرونی رو کنار میزنیم و محتوای داخلی رو برمی‌داریم؛ تا ۳ سطح "
+            "تودرتو، حتی اگه پسوند آرشیو داخلی عوض شده باشه\n"
             "🖼 یه عکس تکی (به یه PDF تک‌صفحه‌ای تبدیل میشه)\n"
             "📄 یه فایل PDF (چون از قبل PDFه، فقط مستقیم آپلود میشه)",
             reply_markup=main_menu()
@@ -1535,7 +1711,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
 
-async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None, host="catbox"):
+async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEFAULT_TYPE, status_msg=None, host="catbox", note=None):
     status = status_msg or await msg.reply_text("در حال آپلود...")
 
     # کاورها (عکس) به Imgur میرن (چون توی ایران بدون فیلترشکن بازه)؛
@@ -1559,12 +1735,15 @@ async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEF
         await _safe_edit(status, "❌ آپلود لغو شد.")
     elif link:
         # لینک با <code> یعنی با یه تپ روش کپی میشه
-        await status.edit_text(
-            f"✅ آپلود شد ({host_name})\nلینک مستقیم:\n<code>{link}</code>",
-            parse_mode="HTML"
-        )
+        text = f"✅ آپلود شد ({host_name})\nلینک مستقیم:\n<code>{link}</code>"
+        if note:
+            text += f"\n\n{note}"
+        await status.edit_text(text, parse_mode="HTML")
     else:
-        await status.edit_text(f"❌ آپلود ناموفق بود، {host_name} جواب نداد.")
+        await status.edit_text(
+            f"❌ آپلود ناموفق بود، {host_name} بعد از چند بار تلاش هم جواب نداد. "
+            "چند دقیقه‌ی دیگه دوباره امتحان کن."
+        )
 
     # ریست کردن حالت و نمایش دوباره‌ی منو بعد از هر آپلود
     context.user_data["mode"] = None
@@ -1626,7 +1805,7 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kind = _detect_convert_kind(msg)
         if kind is None:
             await msg.reply_text(
-                "⚠️ تو حالت «تغییر فرمت به PDF» فقط PDF، ZIP، RAR یا عکس قبول میشه."
+                "⚠️ تو حالت «تغییر فرمت به PDF» فقط PDF، ZIP، RAR (یا CBZ/CBR) یا عکس قبول میشه."
             )
             return
 
@@ -1833,7 +2012,14 @@ def main():
     # timeoutهای پیش‌فرض کتابخونه فقط ۵ ثانیه‌ست که برای فایل‌های حجیم
     # (بالای ۲۰ مگ که از Local Bot API Server دانلود/آپلود میشن) کافی
     # نیست و باعث خطای "Timed out" می‌شد. اینجا بیشترشون می‌کنیم.
+    #
+    # connection_pool_size: وقتی HTTPXRequest رو دستی می‌سازیم، اندازه‌ی استخر
+    # اتصال کوچیکه (پیش‌فرض خودِ کلاس). با concurrent_updates و چند ادمین همزمان،
+    # یه get_file طولانی می‌تونست تنها اتصال رو اشغال کنه و بقیه‌ی درخواست‌ها
+    # (ادیت پیشرفت، ارسال پیام، دانلود ادمین‌های دیگه) پشت سرش صف بکشن و
+    # با خطای Pool timeout بمیرن. اینجا صراحتاً بزرگش می‌کنیم.
     custom_request = HTTPXRequest(
+        connection_pool_size=256,
         connect_timeout=60,
         read_timeout=120,
         write_timeout=120,
