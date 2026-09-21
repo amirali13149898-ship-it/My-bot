@@ -42,6 +42,7 @@ import cairosvg
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler, filters,
     CommandHandler, CallbackQueryHandler
@@ -253,7 +254,7 @@ IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "").strip()
 IMGUR_API = "https://api.imgur.com/3/image"
 IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID", "").strip()
 
-PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه
+PROGRESS_UPDATE_INTERVAL = 5.0  # ثانیه - هر چند وقت یه‌بار نوار پیشرفت آپدیت بشه (۲ ثانیه باعث Flood control میشد)
 
 
 # ===== کنترل همزمانی (مهم وقتی چند ادمین با هم کار می‌کنن) =====
@@ -528,11 +529,43 @@ def upload_imgur(filename, file_bytes, progress_cb=None):
     return None
 
 
+# ===== محافظ Flood control =====
+# وقتی تلگرام RetryAfter میده، تا پایان اون مدت هیچ ادیتِ پیشرفتی نمی‌فرستیم؛
+# قبلاً هر ۲ ثانیه دوباره تلاش می‌شد و همین باعث میشد بن طولانی‌تر بشه.
+_FLOOD_UNTIL = 0.0
+_LAST_EDIT_TEXT = {}  # (chat_id, message_id) -> آخرین متنی که فرستادیم
+
+
+def _note_flood(err):
+    global _FLOOD_UNTIL
+    wait = getattr(err, "retry_after", 30)
+    try:
+        wait = float(wait.total_seconds())  # timedelta در نسخه‌های جدید
+    except AttributeError:
+        wait = float(wait)
+    _FLOOD_UNTIL = max(_FLOOD_UNTIL, time.monotonic() + wait + 1)
+    print(f"🚦 Flood control: تا {int(wait)} ثانیه‌ی دیگه ادیت/ارسال متوقف شد")
+
+
+def _in_flood():
+    return time.monotonic() < _FLOOD_UNTIL
+
+
 async def _safe_edit(status_msg, text, reply_markup=None):
     # نکته: ادیت بدون reply_markup دکمه‌های پیام رو پاک می‌کنه، برای همین
     # هر ادیتِ پیشرفت باید دکمه‌ی لغو رو دوباره بفرسته.
+    if _in_flood():
+        return
+    key = (getattr(status_msg, "chat_id", None), getattr(status_msg, "message_id", None))
+    if _LAST_EDIT_TEXT.get(key) == text:
+        return  # متن عوض نشده، درخواست الکی نفرست
     try:
         await status_msg.edit_text(text, reply_markup=reply_markup)
+        if len(_LAST_EDIT_TEXT) > 500:
+            _LAST_EDIT_TEXT.clear()
+        _LAST_EDIT_TEXT[key] = text
+    except RetryAfter as e:
+        _note_flood(e)
     except Exception:
         pass
 
@@ -1167,6 +1200,10 @@ async def _archive_fix_and_upload(msg, context):
 
         await _safe_edit(status, f"📤 در حال ارسال «{out}»{counter}...")
         try:
+            if _in_flood():
+                wait_left = _FLOOD_UNTIL - time.monotonic()
+                if wait_left <= 120:
+                    await asyncio.sleep(wait_left)
             await msg.reply_document(
                 document=io.BytesIO(item["raw"]),
                 filename=out,
@@ -1177,6 +1214,8 @@ async def _archive_fix_and_upload(msg, context):
             )
             block = f"✅ <b>{html.escape(out)}</b> ارسال شد"
         except Exception as e:
+            if isinstance(e, RetryAfter):
+                _note_flood(e)
             print(f"⚠️ ارسال «{out}» به تلگرام شکست خورد: {e}")
             block = (
                 f"❌ <b>{html.escape(out)}</b>\nارسال فایل ناموفق بود "
@@ -2197,26 +2236,12 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     # لاگ کردن خطا بدون کرش کردن ربات - برای اینکه سرویس رایگان هیچ‌وقت متوقف نشه
+    if isinstance(context.error, RetryAfter):
+        _note_flood(context.error)
     print(f"⚠️ خطا رخ داد: {context.error}")
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
-
-    if USE_SUPABASE:
-        print("✅ ذخیره‌سازی: Supabase (دائمی)")
-    else:
-        print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
-              "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
-
-    if IMGUR_CLIENT_ID:
-        print("✅ کاورها روی Imgur آپلود میشن (بدون فیلتر توی ایران).")
-    else:
-        print("⚠️ IMGUR_CLIENT_ID ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
-
-    threading.Thread(target=run_web, daemon=True).start()
-
+def build_app():
     # timeoutهای پیش‌فرض کتابخونه فقط ۵ ثانیه‌ست که برای فایل‌های حجیم
     # (بالای ۲۰ مگ که از Local Bot API Server دانلود/آپلود میشن) کافی
     # نیست و باعث خطای "Timed out" می‌شد. اینجا بیشترشون می‌کنیم.
@@ -2263,7 +2288,43 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
-    app.run_polling()
+    return app
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
+
+    if USE_SUPABASE:
+        print("✅ ذخیره‌سازی: Supabase (دائمی)")
+    else:
+        print("⚠️ هشدار: SUPABASE_URL / SUPABASE_SERVICE_KEY ست نشده. داده‌ها روی فایل محلی ذخیره میشن "
+              "که روی رندر رایگان با هر ری‌استارت پاک میشه!")
+
+    if IMGUR_CLIENT_ID:
+        print("✅ کاورها روی Imgur آپلود میشن (بدون فیلتر توی ایران).")
+    else:
+        print("⚠️ IMGUR_CLIENT_ID ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
+
+    threading.Thread(target=run_web, daemon=True).start()
+
+    # اگه تلگرام همون اول (initialize/get_me/getUpdates) RetryAfter بده، قبلاً
+    # بات کرش می‌کرد و رندر دائم ری‌استارتش می‌کرد. اینجا صبر می‌کنیم و دوباره امتحان می‌کنیم.
+    while True:
+        app = build_app()
+        try:
+            app.run_polling()
+            break
+        except RetryAfter as e:
+            _note_flood(e)
+            wait = getattr(e, "retry_after", 30)
+            try:
+                wait = wait.total_seconds()
+            except AttributeError:
+                pass
+            wait = int(wait) + 5
+            print(f"🚦 Flood control موقع استارت. {wait} ثانیه صبر می‌کنم و دوباره امتحان می‌کنم...")
+            time.sleep(wait)
 
 
 if __name__ == "__main__":
