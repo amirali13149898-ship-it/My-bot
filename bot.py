@@ -6,6 +6,8 @@ import json
 import time
 import zipfile
 import uuid
+import gc
+import tempfile
 import mimetypes
 import threading
 import asyncio
@@ -902,26 +904,16 @@ def _new_stats():
             "ignored": 0, "bad_images": 0, "bad_archives": 0}
 
 
-def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH,
-                                prefix="", stats=None):
+def _iter_pdf_sources(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH,
+                      prefix="", stats=None):
     """
-    یه فایل زیپ/رار رو باز می‌کنه و همه‌ی عکس‌ها و PDFهای داخلش رو جمع
-    می‌کنه (فرقی نمی‌کنه همه عکس باشن، همه PDF باشن، یا قاطی). اگه
-    داخلش یه آرشیو دیگه (زیپ یا رار) پیدا بشه - حتی اگه پسوندش عوض شده
-    باشه - «پوسته‌ی بیرونی رو کنار می‌زنه» و تا max_depth سطح توش هم
-    دنبال محتوا می‌گرده. هر فایلی که نه عکسه، نه PDF، نه آرشیوِ قابل‌بازکردن
-    (یا عمقش از max_depth بیشتر شده)، به‌سادگی نادیده گرفته میشه - کل
-    عملیات به‌خاطر یه فایل غیرقابل‌تشخیص متوقف نمیشه.
-
-    prefix: مسیر آرشیوهای بیرونی. اسم فایل‌های داخلی با این پیشوند ذخیره
-    میشن (مثلاً «ch2.rar/01.jpg») تا مرتب‌سازی نهایی، عکس‌های هر آرشیوِ
-    داخلی رو کنار هم نگه داره و 01.jpg از دو رار مختلف قاطی نشه.
-
-    خروجی: لیستی از (name, raw_bytes, etype) که هنوز مرتب نشده.
+    نسخه‌ی «جریانی» (generator): آیتم‌ها رو یکی‌یکی و به ترتیب اسم می‌ده
+    (name, raw_bytes, etype) بدون اینکه همه‌ی عکس‌ها هم‌زمان توی رم باشن.
+    آرشیو تودرتو (زیپ/رار) هم همون‌جا که رسیدیم باز میشه و ادامه پیدا می‌کنه.
+    فایل غیرعکس/غیرPDF یا خراب فقط نادیده گرفته میشه و کل کار متوقف نمیشه.
     """
     if stats is None:
         stats = _new_stats()
-    collected = []
     try:
         with _open_archive(archive_bytes, kind) as af:
             names = [
@@ -943,45 +935,43 @@ def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_A
                 full_name = f"{prefix}{name}"
                 etype = _classify_entry(name, raw)
                 if etype in ("image", "pdf"):
-                    collected.append((full_name, raw, etype))
+                    yield (full_name, raw, etype)
                 elif etype in ("zip", "rar") and depth < max_depth:
                     stats["nested"] += 1
-                    collected.extend(
-                        _collect_pdf_source_entries(
-                            raw, etype, depth + 1, max_depth,
-                            prefix=f"{full_name}/", stats=stats,
-                        )
+                    yield from _iter_pdf_sources(
+                        raw, etype, depth + 1, max_depth,
+                        prefix=f"{full_name}/", stats=stats,
                     )
                 else:
-                    # نه عکسه، نه PDF، نه آرشیو قابل‌بازکردن -> نادیده گرفته میشه
                     stats["ignored"] += 1
+                raw = None
     except Exception as e:
         print(f"⚠️ باز کردن آرشیو (kind={kind}) شکست خورد: {e}")
         stats["bad_archives"] += 1
-        return []
-    return collected
+
+
+def _collect_pdf_source_entries(archive_bytes, kind, depth=1, max_depth=NESTED_ARCHIVE_MAX_DEPTH,
+                                prefix="", stats=None):
+    """نسخه‌ی لیستی (فقط برای سازگاری؛ رم زیادی می‌گیره) - ترجیحاً _iter_pdf_sources."""
+    return list(_iter_pdf_sources(archive_bytes, kind, depth, max_depth, prefix, stats))
 
 
 def _archive_to_pdf(archive_bytes, kind, stats=None):
     """
     همه‌ی عکس‌ها و PDFهای داخل یه آرشیو (و آرشیوهای تودرتوش) رو به
-    ترتیب اسم، توی یه PDF واحد می‌چسبونه. صفحات عکس‌ها با img2pdf (بدون
-    افت کیفیت) ساخته میشن و صفحات PDFهای داخلی عیناً (با pypdf) کپی
-    میشن. اگه هیچ عکس/PDF معتبری پیدا نشه، None برمی‌گردونه.
-    اگه stats (دیکشنری) داده بشه، آمار کار توش پر میشه.
+    ترتیب اسم، توی یه PDF واحد می‌چسبونه. هر فایل یکی‌یکی خونده و به PDF
+    اضافه میشه و بعدش از رم آزاد میشه (قبلاً همه‌ی عکس‌ها هم‌زمان توی رم
+    جمع می‌شدن و روی رندر ۵۱۲ مگی رم پر می‌شد).
+    اگه هیچ عکس/PDF معتبری پیدا نشه، None برمی‌گردونه.
     """
     if stats is None:
         stats = _new_stats()
-    entries = _collect_pdf_source_entries(archive_bytes, kind, stats=stats)
-    if not entries:
-        return None
-
-    entries.sort(key=lambda e: _natural_sort_key(e[0]))
 
     writer = pypdf.PdfWriter()
     any_added = False
+    count = 0
 
-    for _name, raw, etype in entries:
+    for _name, raw, etype in _iter_pdf_sources(archive_bytes, kind, stats=stats):
         try:
             if etype == "image":
                 img_ready = _to_img2pdf_bytes(raw)
@@ -990,6 +980,7 @@ def _archive_to_pdf(archive_bytes, kind, stats=None):
                     continue
                 single_page_pdf = img2pdf.convert([img_ready])
                 reader = pypdf.PdfReader(io.BytesIO(single_page_pdf))
+                img_ready = single_page_pdf = None
             else:  # pdf
                 reader = pypdf.PdfReader(io.BytesIO(raw))
 
@@ -1000,7 +991,11 @@ def _archive_to_pdf(archive_bytes, kind, stats=None):
         except Exception:
             # یه صفحه/فایل خراب کل عملیات رو متوقف نمی‌کنه، فقط ردش می‌کنیم
             stats["bad_images"] += 1
-            continue
+        finally:
+            raw = None
+            count += 1
+            if count % 10 == 0:
+                gc.collect()
 
     if not any_added:
         return None
@@ -1011,6 +1006,8 @@ def _archive_to_pdf(archive_bytes, kind, stats=None):
         writer.write(out)
     except Exception:
         return None
+    writer = None
+    gc.collect()
     return out.getvalue()
 
 
@@ -1661,7 +1658,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = None
     context.user_data["connect_images"] = []
     context.user_data.pop("connect_status_msg_id", None)
-    context.user_data["bulk_files"] = []
+    _clear_bulk(context.user_data)
     context.user_data.pop("bulk_status_msg_id", None)
     await update.message.reply_text(
         "یکی از حالت‌ها رو انتخاب کن:",
@@ -1699,6 +1696,51 @@ async def handle_connect_done(update: Update, context: ContextTypes.DEFAULT_TYPE
     await process_and_reply(query.message, "connected.pdf", pdf_bytes, context)
 
 
+def _label_html(label):
+    """
+    اسم فایل رو برای نمایش HTML آماده می‌کنه: متن معمولی بولد میشه و هر عددی
+    توی اسم داخل <code> میره تا با یه تپ کپی بشه (مثلاً «Chapter 12» ->
+    Chapter و 12 قابل‌کپی). کاراکترهای خاص HTML escape میشن.
+    """
+    parts = re.split(r"(\d+(?:\.\d+)?)", label)
+    out = []
+    for part in parts:
+        if not part:
+            continue
+        esc = html.escape(part)
+        if re.fullmatch(r"\d+(?:\.\d+)?", part):
+            out.append(f"<code>{esc}</code>")
+        else:
+            out.append(f"<b>{esc}</b>")
+    return "".join(out) or html.escape(label)
+
+
+# ===== آپلود گروهی: فایل‌ها روی دیسک موقت نگه داشته میشن نه توی رم =====
+_BULK_TMP_DIR = os.path.join(tempfile.gettempdir(), "bot_bulk")
+
+
+def _spool_bytes(data):
+    os.makedirs(_BULK_TMP_DIR, exist_ok=True)
+    path = os.path.join(_BULK_TMP_DIR, uuid.uuid4().hex)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _remove_quiet(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _clear_bulk(user_data):
+    for item in user_data.get("bulk_files", []) or []:
+        if item.get("path"):
+            _remove_quiet(item["path"])
+    user_data["bulk_files"] = []
+
+
 # ==================== بخش آپلود گروهی ====================
 
 async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1733,9 +1775,18 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 batch_cancelled = True
                 break
 
+            raw_bytes = upload_bytes = pdf_bytes = None
+            gc.collect()
+
             label = item["label"]
-            raw_bytes = item["bytes"]
             kind = item["kind"]
+            try:
+                with open(item["path"], "rb") as f:
+                    raw_bytes = f.read()
+            except OSError:
+                results.append((label, None, "فایل موقت پیدا نشد (سرور ری‌استارت شده؛ دوباره بفرست)"))
+                continue
+            _remove_quiet(item["path"])
 
             header = f"⏳ در حال آپلود {idx} از {total}\n(فایل فعلی: {label})"
             try:
@@ -1821,7 +1872,7 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(chunk, parse_mode="HTML")
 
     context.user_data["mode"] = None
-    context.user_data["bulk_files"] = []
+    _clear_bulk(context.user_data)
     context.user_data.pop("bulk_status_msg_id", None)
     await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
 
@@ -1929,21 +1980,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
     elif data == "mode_bulk":
         context.user_data["mode"] = "bulk_upload"
-        context.user_data["bulk_files"] = []
+        _clear_bulk(context.user_data)
         context.user_data.pop("bulk_status_msg_id", None)
         await query.edit_message_text(
             "حالت «آپلود گروهی» فعال شد ✅\n\n"
-            "فایل‌های PDF یا ZIP رو یکی‌یکی بفرست — نوع هر فایل خودکار تشخیص "
-            "داده میشه (PDF مستقیم آپلود میشه، ZIP اول به PDF تبدیل میشه).\n\n"
-            "وقتی همه رو فرستادی، زیر آخرین فایل دکمه‌ی «✅ تمام» رو بزن تا "
-            "همه یکی‌یکی لینک بشن (اسم هر فایل بالای لینکش نوشته میشه)."
+            "فایل‌های PDF یا ZIP رو یکی‌یکی (یا پشت‌سرهم) بفرست. هر فایل همون لحظه "
+            "پردازش میشه: ZIP اول به PDF تبدیل میشه، بعد آپلود میشه و لینکش زیر "
+            "همون فایل با اسمش میاد، بعد نوبت فایل بعدیه.\n\n"
+            "برای خروج از این حالت /start رو بزن."
         )
     elif data == "bulk_done":
         async with _user_lock(user_id):
             await handle_bulk_done(update, context)
     elif data == "bulk_cancel":
         context.user_data["mode"] = None
-        context.user_data["bulk_files"] = []
+        _clear_bulk(context.user_data)
         context.user_data.pop("bulk_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
@@ -2125,9 +2176,9 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif mode == "bulk_upload":
-        # این حالت هم PDF قبول می‌کنه هم ZIP - نوعش خودکار تشخیص داده میشه
-        files_list = context.user_data.setdefault("bulk_files", [])
-
+        # هر فایل (PDF یا ZIP) همون لحظه‌ای که میاد پردازش میشه:
+        # دریافت -> (اگه ZIP بود) تبدیل به PDF -> آپلود -> فرستادن لینک -> فایل بعدی.
+        # هیچ فایلی توی رم یا دیسک جمع نمیشه، پس دکمه‌ی «تمام» لازم نیست.
         is_pdf = (
             msg.document
             and (
@@ -2149,57 +2200,81 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        dl_label = msg.document.file_name or "فایل"
+        original_name = msg.document.file_name or "file"
+        label = os.path.splitext(original_name)[0] or "file"
+        safe_label = _label_html(label)
+        dl_label = original_name
+
         status = await msg.reply_text(f"⬇️ در حال دریافت {dl_label}...")
         try:
             file_bytes = await download_with_progress(
                 msg.document, status, msg.document.file_size, prefix=f"⬇️ در حال دریافت {dl_label}..."
             )
         except TaskCancelled:
-            # فقط همین فایل لغو میشه؛ حالت گروهی فعال می‌مونه و می‌تونی فایل بعدی رو بفرستی
             await _safe_edit(status, f"❌ دریافت {dl_label} لغو شد.")
             return
         except Exception as e:
-            await status.edit_text(f"❌ خطا توی دریافت فایل: {e}")
-            return
-        await status.delete()
-
-        original_name = msg.document.file_name or f"file_{len(files_list) + 1:02d}"
-        label = os.path.splitext(original_name)[0] or f"file_{len(files_list) + 1:02d}"
-        kind = "pdf" if is_pdf else "zip"
-        files_list.append({"label": label, "bytes": file_bytes, "kind": kind})
-
-        pdf_count = sum(1 for f in files_list if f["kind"] == "pdf")
-        zip_count = sum(1 for f in files_list if f["kind"] == "zip")
-        status_text = (
-            f"📥 {len(files_list)} فایل دریافت شد ({pdf_count} PDF، {zip_count} ZIP).\n"
-            "وقتی تموم شد «تمام» رو بزن."
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ تمام", callback_data="bulk_done"),
-                InlineKeyboardButton("❌ انصراف", callback_data="bulk_cancel"),
-            ]
-        ])
-
-        last_status_id = context.user_data.get("bulk_status_msg_id")
-        edited = False
-        if last_status_id:
             try:
-                await context.bot.edit_message_text(
-                    chat_id=msg.chat_id,
-                    message_id=last_status_id,
-                    text=status_text,
-                    reply_markup=keyboard,
-                )
-                edited = True
+                await status.edit_text(f"❌ خطا توی دریافت {dl_label}: {e}")
             except Exception:
-                edited = False
+                pass
+            return
 
-        if not edited:
-            sent = await msg.reply_text(status_text, reply_markup=keyboard)
-            context.user_data["bulk_status_msg_id"] = sent.message_id
+        note = ""
+        if is_zip:
+            await _safe_edit(status, f"🛠 در حال تبدیل «{label}» به PDF...")
+            try:
+                upload_bytes, stats = await _run_heavy(_archive_to_pdf_with_stats, file_bytes, "zip")
+            except Exception as e:
+                file_bytes = None
+                try:
+                    await status.edit_text(f"📄 {safe_label}\n⚠️ خطا در تبدیل زیپ: {html.escape(str(e))}", parse_mode="HTML")
+                except Exception:
+                    pass
+                return
+            file_bytes = None
+            if upload_bytes is None:
+                try:
+                    await status.edit_text(
+                        f"📄 {safe_label}\n⚠️ هیچ عکس یا PDF معتبری توی زیپ پیدا نشد یا زیپ خراب بود",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                return
+            upload_filename = f"{label}.pdf"
+            note = _describe_stats(stats)
+        else:
+            upload_bytes = file_bytes
+            file_bytes = None
+            upload_filename = original_name if original_name.lower().endswith(".pdf") else f"{label}.pdf"
 
+        try:
+            link = await upload_catbox_with_progress(
+                upload_filename, upload_bytes, status,
+                prefix=f"⬆️ در حال آپلود «{upload_filename}»",
+            )
+        except TaskCancelled:
+            upload_bytes = None
+            await _safe_edit(status, f"❌ آپلود {label} لغو شد.")
+            return
+        upload_bytes = None
+        gc.collect()
+
+        if link:
+            text = f"📄 {safe_label}\n<code>{link}</code>"
+            if note:
+                text += f"\n\n{html.escape(note)}"
+        else:
+            text = f"📄 {safe_label}\n⚠️ آپلود به Catbox ناموفق بود"
+        try:
+            await status.edit_text(text, parse_mode="HTML")
+        except Exception:
+            try:
+                await msg.reply_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+        # حالت گروهی فعال می‌مونه تا فایل بعدی رو بفرستی
         return
 
     else:
