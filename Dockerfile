@@ -18,6 +18,7 @@ COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-a
 #   - ghostscript         -> باز کردن EPS و فایل‌های قدیمی AI (پیلو خودش صداش می‌زنه)
 #   - libraw + libraw-dev -> فرمت‌های خام دوربین (CR2/CR3/NEF/ARW/DNG) با rawpy
 #   - libarchive-tools    -> باینری bsdtar که rarfile برای استخراج واقعیِ RAR بهش نیاز داره
+#   - findutils           -> find کامل با پشتیبانی -mmin (برای پاکسازی خودکار)
 #   - gcc/g++/musl-dev/python3-dev/make/pkgconfig -> برای اینکه rawpy (که
 #     ویل آماده برای Alpine/musl نداره) از سورس کامپایل بشه
 RUN apk add --no-cache \
@@ -25,6 +26,7 @@ RUN apk add --no-cache \
     jpeg zlib libjpeg-turbo \
     libarchive \
     libarchive-tools \
+    findutils \
     libheif \
     libavif \
     cairo pango gdk-pixbuf fontconfig ttf-dejavu \
