@@ -87,6 +87,7 @@ def build_app():
         print("⚠️ Local Bot API غیرفعاله - از api.telegram.org استفاده میشه (سقف ۲۰/۵۰ مگابایت).")
 
     app = builder.build()
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
