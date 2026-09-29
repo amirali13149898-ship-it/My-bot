@@ -101,7 +101,7 @@ def save_users(users):
     threading.Thread(target=_write_users, args=(snapshot, _save_seq), daemon=True).start()
 
 
-# {user_id_str: {first_name, username, allowed, is_admin}}
+# {user_id_str: {first_name, username, allowed, is_admin, uploads}}
 USERS = load_users()
 
 
