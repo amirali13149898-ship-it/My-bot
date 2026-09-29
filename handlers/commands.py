@@ -106,4 +106,4 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"نتایج جستجو (صفحه {page + 1} از {total_pages}):",
             reply_markup=keyboard
-        )
+    )
