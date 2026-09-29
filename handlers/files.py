@@ -113,7 +113,7 @@ async def _download_and_upload(msg, context, file_src, filename):
 # ==================== آپلود گروهی ====================
 
 async def _handle_bulk_file(msg, context, user_id):
-    # هر فایل (PDF یا ZIP) همون لحظه‌ای که میاد پردازش میشه:
+    # هر فایل (PDF، ZIP یا عکس) همون لحظه‌ای که میاد پردازش میشه:
     # دریافت -> (اگه ZIP بود) تبدیل به PDF -> آپلود -> فرستادن لینک -> فایل بعدی.
     # هیچ فایلی توی رم یا دیسک جمع نمیشه، پس دکمه‌ی «تمام» لازم نیست.
     is_pdf = (
@@ -130,9 +130,16 @@ async def _handle_bulk_file(msg, context, user_id):
             or (msg.document.file_name and msg.document.file_name.lower().endswith(".zip"))
         )
     )
+    is_img = bool(
+        msg.document
+        and (
+            (msg.document.mime_type or "") in _DIRECT_IMAGE_MIMES
+            or (msg.document.file_name or "").lower().endswith(_DIRECT_IMAGE_EXTS)
+        )
+    )
 
-    if not (is_pdf or is_zip):
-        await msg.reply_text("⚠️ تو حالت «آپلود گروهی» فقط فایل PDF یا ZIP قبول میشه.")
+    if not (is_pdf or is_zip or is_img):
+        await msg.reply_text("⚠️ تو حالت «آپلود گروهی» فقط PDF، ZIP یا عکس (PNG/JPG/WEBP/GIF) قبول میشه.")
         return
 
     original_name = msg.document.file_name or "file"
@@ -182,7 +189,10 @@ async def _handle_bulk_file(msg, context, user_id):
     else:
         upload_bytes = file_bytes
         file_bytes = None
-        upload_filename = original_name if original_name.lower().endswith(".pdf") else f"{label}.pdf"
+        if is_img:
+            upload_filename = original_name
+        else:
+            upload_filename = original_name if original_name.lower().endswith(".pdf") else f"{label}.pdf"
 
     try:
         link = await upload_catbox_with_progress(
