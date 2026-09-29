@@ -5,6 +5,7 @@ from core.config import IMGUR_CLIENT_ID
 from core.keyboards import main_menu
 from core.tasks import TaskCancelled
 from core.telegram_io import _safe_edit, upload_catbox_with_progress
+from core.users import bump_upload
 from services.uploaders import upload_catbox, upload_imgur
 
 
@@ -31,6 +32,7 @@ async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEF
     if cancelled:
         await _safe_edit(status, "❌ آپلود لغو شد.")
     elif link:
+        bump_upload(msg.chat_id)
         # لینک با <code> یعنی با یه تپ روش کپی میشه
         text = f"✅ آپلود شد ({host_name})\nلینک مستقیم:\n<code>{link}</code>"
         if note:
@@ -45,6 +47,6 @@ async def process_and_reply(msg, filename, file_bytes, context: ContextTypes.DEF
     # ریست کردن حالت و نمایش دوباره‌ی منو بعد از هر آپلود
     context.user_data["mode"] = None
     await msg.reply_text(
-        "یکی از حالت‌ها رو انتخاب کن:",
+        "یکی از گزینه‌ها رو انتخاب کن:",
         reply_markup=main_menu()
     )
