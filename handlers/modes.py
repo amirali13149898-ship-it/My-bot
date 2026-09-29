@@ -8,43 +8,18 @@ from core.users import is_allowed
 from handlers.access import handle_request_access, handle_request_decision
 from handlers.admin import admin_callback_handler
 from handlers.bulk import _clear_bulk, handle_bulk_done
-from handlers.connect import handle_connect_done
 
 
 MODE_TEXTS = {
-    "cover": (
-        "حالت «آپلود کاور» فعال شد ✅\nفقط عکس بفرست (هیچ فرمت دیگه‌ای به جز عکس قبول نمی‌کنیم)."
-    ),
-    "pdf": (
-        "حالت «آپلود PDF» فعال شد ✅\nفقط فایل PDF بفرست (هر فایل دیگه‌ای رد میشه)."
-    ),
-    "to_pdf": (
-        "حالت «تغییر فرمت به PDF» فعال شد ✅\n\n"
-        "هر کدوم از این‌ها رو بفرستی، خودکار تشخیص داده میشه:\n"
-        "📦 ZIP یا 🗜️ RAR (یا CBZ/CBR) — هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
-        "توی یه PDF واحد می‌چسبونیم. اگه داخل زیپ یه رار باشه (یا برعکس) "
-        "پوسته‌ی بیرونی رو کنار میزنیم و محتوای داخلی رو برمی‌داریم؛ تا ۳ سطح "
-        "تودرتو، حتی اگه پسوند آرشیو داخلی عوض شده باشه\n"
-        "🖼 یه عکس تکی (به یه PDF تک‌صفحه‌ای تبدیل میشه)\n"
-        "📄 یه فایل PDF (چون از قبل PDFه، فقط مستقیم آپلود میشه)"
-    ),
-    "connect": (
-        "حالت «اتصال عکس‌ها به PDF» فعال شد ✅\n\n"
-        "عکس‌ها رو یکی‌یکی، به‌صورت «فایل» (Document) بفرست — نه عکس فشرده، "
-        "چون تلگرام موقع فشرده‌سازی اسم فایل رو حذف می‌کنه.\n"
-        "اسم هر عکس باید با شماره باشه (مثل 01.jpg، 02.jpg، ...) — بات بر اساس "
-        "همین شماره‌ها ترتیب صفحات PDF نهایی رو تعیین می‌کنه، نه ترتیب ارسال.\n\n"
-        "وقتی همه رو فرستادی، زیر آخرین عکس دکمه‌ی «✅ تمام» رو بزن."
-    ),
-    "archive_fix": (
-        "حالت «اصلاح و آپلود آرشیو» فعال شد ✅\n\n"
-        "فایل ZIP / RAR / 7z (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
-        "به PDF تبدیل نمیشه و لینک هم نمیده؛ خودِ فایل خام برات فرستاده میشه:\n"
-        "🔧 نوع واقعی از روی محتوا تشخیص داده میشه و با پسوند درست فرستاده میشه "
-        "(مثلاً زیپی که در اصل رار بوده → .rar)\n"
-        "🔓 اگه آرشیو فقط یه پوسته بود (زیپ توی رار، رار توی زیپ و ...)، "
-        "پوسته‌ی بیرونی کنار زده میشه و همون آرشیو داخلی به‌صورت فایل برات میاد\n\n"
-        "می‌تونی پشت‌سرهم چند فایل بفرستی."
+    "single": (
+        "حالت «آپلود تکی» فعال شد ✅\n\n"
+        "یه فایل بفرست، نوعش خودکار تشخیص داده میشه:\n"
+        "🖼 عکس ← مستقیم آپلود میشه و لینک میگیری\n"
+        "📄 PDF ← مستقیم آپلود میشه\n"
+        "📦 ZIP / 🗜️ RAR (یا CBZ/CBR) ← عکس‌ها و PDFهای داخلش به ترتیب اسم "
+        "توی یه PDF میرن و آپلود میشن؛ آرشیو تودرتو یا با پسوند اشتباه هم مشکلی نیست\n"
+        "🔄 فرمت‌های خاص (HEIC، SVG، RAW و ...) ← اول به PDF تبدیل میشن\n\n"
+        "چند تا عکس رو می‌خوای به یه PDF وصل کنی؟ زیپشون کن و همون رو بفرست."
     ),
     "bulk_upload": (
         "حالت «آپلود گروهی» فعال شد ✅\n\n"
@@ -55,12 +30,13 @@ MODE_TEXTS = {
     ),
 }
 
+# دکمه‌های شیشه‌ایِ قدیمیِ منو (پیام‌های قدیمی که هنوز توی چت مونده)
 _LEGACY_CALLBACK_TO_MODE = {
-    "mode_cover": "cover",
-    "mode_pdf": "pdf",
-    "mode_to_pdf": "to_pdf",
-    "mode_connect": "connect",
-    "mode_archive": "archive_fix",
+    "mode_cover": "single",
+    "mode_pdf": "single",
+    "mode_to_pdf": "single",
+    "mode_connect": "single",
+    "mode_archive": "single",
     "mode_bulk": "bulk_upload",
 }
 
@@ -69,10 +45,7 @@ async def activate_mode(msg, context, mode):
     """حالت انتخاب‌شده رو فعال می‌کنه و پیام توضیح رو می‌فرسته (با کیبورد کپشنی)."""
     ud = context.user_data
     ud["mode"] = mode
-    if mode == "connect":
-        ud["connect_images"] = []
-        ud.pop("connect_status_msg_id", None)
-    elif mode == "bulk_upload":
+    if mode == "bulk_upload":
         _clear_bulk(ud)
         ud.pop("bulk_status_msg_id", None)
     await msg.reply_text(MODE_TEXTS[mode], reply_markup=main_menu())
@@ -115,21 +88,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # دکمه‌های شیشه‌ای قدیمیِ منو (پیام‌های قدیمی که هنوز توی چت مونده)
     if data in _LEGACY_CALLBACK_TO_MODE:
         await activate_mode(query.message, context, _LEGACY_CALLBACK_TO_MODE[data])
-    elif data == "connect_done":
-        async with _user_lock(user_id):
-            await handle_connect_done(update, context)
-    elif data == "connect_cancel":
-        context.user_data["mode"] = None
-        context.user_data["connect_images"] = []
-        context.user_data.pop("connect_status_msg_id", None)
-        await query.edit_message_text("❌ لغو شد.")
-        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
     elif data == "mode_menu":
         context.user_data["mode"] = None
-        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        await query.message.reply_text("یکی از گزینه‌ها رو انتخاب کن:", reply_markup=main_menu())
     elif data == "bulk_done":
         async with _user_lock(user_id):
             await handle_bulk_done(update, context)
@@ -138,4 +101,4 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _clear_bulk(context.user_data)
         context.user_data.pop("bulk_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
-        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
+        await query.message.reply_text("یکی از گزینه‌ها رو انتخاب کن:", reply_markup=main_menu())
