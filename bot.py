@@ -23,16 +23,6 @@ from core.config import (
 )
 from core.keyboards import track_user
 from core.telegram_io import _note_flood
-from telegram.request import HTTPXRequest
-
-from core.config import (
-    BOT_TOKEN,
-    IMGUR_CLIENT_ID,
-    LOCAL_BOT_API_URL,
-    USE_LOCAL_BOT_API,
-    USE_SUPABASE,
-)
-from core.telegram_io import _note_flood
 from core.webserver import run_web
 from handlers.admin import admin_command
 from handlers.commands import handle_text, myid, start
