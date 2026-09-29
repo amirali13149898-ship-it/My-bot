@@ -42,7 +42,7 @@ import rawpy
 # SVG (وکتور) - قبل از هرکاری باید به PNG رندر بشه
 import cairosvg
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.request import HTTPXRequest
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -651,6 +651,26 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
             _end_task(task_id)
 
 
+async def read_and_free(file_obj):
+    """
+    فایل رو از دیسکِ Local Bot API می‌خونه و بلافاصله همون نسخه رو پاک می‌کنه.
+
+    توی local_mode مسیر file_path یه فایل واقعی روی دیسکه و سرور هیچوقت
+    خودش پاکش نمی‌کنه؛ قبلاً تا ۳۰ دقیقه (تا اجرای پاکسازی دوره‌ای) می‌موند و
+    چند فایل حجیم پشت هم دیسک رندر رو پر می‌کرد. الان بایت‌ها میرن توی رم و
+    نسخه‌ی دیسک همون لحظه آزاد میشه.
+    """
+    path = getattr(file_obj, "file_path", None)
+    try:
+        return bytes(await file_obj.download_as_bytearray())
+    finally:
+        if path and os.path.isabs(str(path)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 async def download_with_progress(file_src, status_msg, total_size, prefix="⬇️ در حال دریافت..."):
     """
     file_src یه Document/PhotoSize تلگرامه (چیزی که .get_file() داره).
@@ -676,7 +696,7 @@ async def download_with_progress(file_src, status_msg, total_size, prefix="⬇�
             read_timeout=TELEGRAM_FILE_TIMEOUT,
             pool_timeout=TELEGRAM_FILE_TIMEOUT,
         )
-        return bytes(await file_obj.download_as_bytearray())
+        return await read_and_free(file_obj)
 
     work = asyncio.ensure_future(_work())
     state["task"] = work
@@ -708,16 +728,29 @@ async def download_with_progress(file_src, status_msg, total_size, prefix="⬇�
         _end_task(task_id)
 
 
+# ===== منوی اصلی: کیبورد کپشنی (Reply Keyboard) =====
+# متن هر دکمه همون چیزیه که وقت زدن به‌عنوان پیام فرستاده میشه و handle_text
+# اونو به حالت مربوطه تبدیل می‌کنه. دکمه‌های شیشه‌ای فقط برای چیزهایی مثل
+# «لغو»/«تمام» زیر پیام‌های پیشرفت می‌مونن.
+MENU_BUTTONS = [
+    ("📷 آپلود کاور", "cover"),
+    ("📄 آپلود PDF", "pdf"),
+    ("🔄 تغییر فرمت به PDF", "to_pdf"),
+    ("🔗 اتصال عکس‌ها به PDF", "connect"),
+    ("🗜️ اصلاح و آپلود آرشیو", "archive_fix"),
+    ("📚 آپلود گروهی", "bulk_upload"),
+]
+MENU_LABEL_TO_MODE = {label: mode for label, mode in MENU_BUTTONS}
+
+
 def main_menu():
-    keyboard = [
-        [InlineKeyboardButton("📷 آپلود کاور", callback_data="mode_cover")],
-        [InlineKeyboardButton("📄 آپلود PDF", callback_data="mode_pdf")],
-        [InlineKeyboardButton("🔄 تغییر فرمت به PDF", callback_data="mode_to_pdf")],
-        [InlineKeyboardButton("🔗 اتصال عکس‌ها به PDF", callback_data="mode_connect")],
-        [InlineKeyboardButton("🗜️ اصلاح و آپلود آرشیو", callback_data="mode_archive")],
-        [InlineKeyboardButton("📚 آپلود گروهی", callback_data="mode_bulk")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    rows = [[label] for label, _ in MENU_BUTTONS]
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="یکی از حالت‌ها رو انتخاب کن",
+    )
 
 
 IMAGE_EXTENSIONS = (
@@ -1232,10 +1265,8 @@ async def _archive_fix_and_upload(msg, context):
 
     # حالت فعال می‌مونه تا بشه پشت‌سرهم فایل فرستاد
     await msg.reply_text(
-        "فایل بعدی رو بفرست، یا برای برگشت:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="mode_menu")]
-        ]),
+        "فایل بعدی رو بفرست، یا یکی از حالت‌های پایین رو بزن:",
+        reply_markup=main_menu(),
     )
 
 # ==================== پایان بخش اصلاح و آپلود آرشیو ====================
@@ -1545,8 +1576,19 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # فقط برای جستجوی آیدی توسط ادمین استفاده میشه
     user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    # زدن یکی از دکمه‌های کیبورد کپشنیِ منوی اصلی
+    if text in MENU_LABEL_TO_MODE:
+        if not is_allowed(user_id):
+            await update.message.reply_text("⛔ شما اجازه استفاده از این ربات رو ندارید.")
+            return
+        context.user_data.pop("awaiting_admin_search", None)
+        await activate_mode(update.message, context, MENU_LABEL_TO_MODE[text])
+        return
+
+    # بقیه‌ی متن‌ها فقط برای جستجوی آیدی توسط ادمین استفاده میشه
     if is_admin(user_id) and context.user_data.get("awaiting_admin_search"):
         context.user_data.pop("awaiting_admin_search", None)
         term = update.message.text.strip()
@@ -1879,6 +1921,73 @@ async def handle_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== پایان بخش آپلود گروهی ====================
 
 
+MODE_TEXTS = {
+    "cover": (
+        "حالت «آپلود کاور» فعال شد ✅\nفقط عکس بفرست (هیچ فرمت دیگه‌ای به جز عکس قبول نمی‌کنیم)."
+    ),
+    "pdf": (
+        "حالت «آپلود PDF» فعال شد ✅\nفقط فایل PDF بفرست (هر فایل دیگه‌ای رد میشه)."
+    ),
+    "to_pdf": (
+        "حالت «تغییر فرمت به PDF» فعال شد ✅\n\n"
+        "هر کدوم از این‌ها رو بفرستی، خودکار تشخیص داده میشه:\n"
+        "📦 ZIP یا 🗜️ RAR (یا CBZ/CBR) — هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
+        "توی یه PDF واحد می‌چسبونیم. اگه داخل زیپ یه رار باشه (یا برعکس) "
+        "پوسته‌ی بیرونی رو کنار میزنیم و محتوای داخلی رو برمی‌داریم؛ تا ۳ سطح "
+        "تودرتو، حتی اگه پسوند آرشیو داخلی عوض شده باشه\n"
+        "🖼 یه عکس تکی (به یه PDF تک‌صفحه‌ای تبدیل میشه)\n"
+        "📄 یه فایل PDF (چون از قبل PDFه، فقط مستقیم آپلود میشه)"
+    ),
+    "connect": (
+        "حالت «اتصال عکس‌ها به PDF» فعال شد ✅\n\n"
+        "عکس‌ها رو یکی‌یکی، به‌صورت «فایل» (Document) بفرست — نه عکس فشرده، "
+        "چون تلگرام موقع فشرده‌سازی اسم فایل رو حذف می‌کنه.\n"
+        "اسم هر عکس باید با شماره باشه (مثل 01.jpg، 02.jpg، ...) — بات بر اساس "
+        "همین شماره‌ها ترتیب صفحات PDF نهایی رو تعیین می‌کنه، نه ترتیب ارسال.\n\n"
+        "وقتی همه رو فرستادی، زیر آخرین عکس دکمه‌ی «✅ تمام» رو بزن."
+    ),
+    "archive_fix": (
+        "حالت «اصلاح و آپلود آرشیو» فعال شد ✅\n\n"
+        "فایل ZIP / RAR / 7z (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
+        "به PDF تبدیل نمیشه و لینک هم نمیده؛ خودِ فایل خام برات فرستاده میشه:\n"
+        "🔧 نوع واقعی از روی محتوا تشخیص داده میشه و با پسوند درست فرستاده میشه "
+        "(مثلاً زیپی که در اصل رار بوده → .rar)\n"
+        "🔓 اگه آرشیو فقط یه پوسته بود (زیپ توی رار، رار توی زیپ و ...)، "
+        "پوسته‌ی بیرونی کنار زده میشه و همون آرشیو داخلی به‌صورت فایل برات میاد\n\n"
+        "می‌تونی پشت‌سرهم چند فایل بفرستی."
+    ),
+    "bulk_upload": (
+        "حالت «آپلود گروهی» فعال شد ✅\n\n"
+        "فایل‌های PDF یا ZIP رو یکی‌یکی (یا پشت‌سرهم) بفرست. هر فایل همون لحظه "
+        "پردازش میشه: ZIP اول به PDF تبدیل میشه، بعد آپلود میشه و لینکش زیر "
+        "همون فایل با اسمش میاد، بعد نوبت فایل بعدیه.\n\n"
+        "برای خروج از این حالت /start رو بزن."
+    ),
+}
+
+_LEGACY_CALLBACK_TO_MODE = {
+    "mode_cover": "cover",
+    "mode_pdf": "pdf",
+    "mode_to_pdf": "to_pdf",
+    "mode_connect": "connect",
+    "mode_archive": "archive_fix",
+    "mode_bulk": "bulk_upload",
+}
+
+
+async def activate_mode(msg, context, mode):
+    """حالت انتخاب‌شده رو فعال می‌کنه و پیام توضیح رو می‌فرسته (با کیبورد کپشنی)."""
+    ud = context.user_data
+    ud["mode"] = mode
+    if mode == "connect":
+        ud["connect_images"] = []
+        ud.pop("connect_status_msg_id", None)
+    elif mode == "bulk_upload":
+        _clear_bulk(ud)
+        ud.pop("bulk_status_msg_id", None)
+    await msg.reply_text(MODE_TEXTS[mode], reply_markup=main_menu())
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1916,43 +2025,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    if data == "mode_cover":
-        context.user_data["mode"] = "cover"
-        await query.edit_message_text(
-            "حالت «آپلود کاور» فعال شد ✅\nفقط عکس بفرست (هیچ فرمت دیگه‌ای به جز عکس قبول نمی‌کنیم).",
-            reply_markup=main_menu()
-        )
-    elif data == "mode_pdf":
-        context.user_data["mode"] = "pdf"
-        await query.edit_message_text(
-            "حالت «آپلود PDF» فعال شد ✅\nفقط فایل PDF بفرست (هر فایل دیگه‌ای رد میشه).",
-            reply_markup=main_menu()
-        )
-    elif data == "mode_to_pdf":
-        context.user_data["mode"] = "to_pdf"
-        await query.edit_message_text(
-            "حالت «تغییر فرمت به PDF» فعال شد ✅\n\n"
-            "هر کدوم از این‌ها رو بفرستی، خودکار تشخیص داده میشه:\n"
-            "📦 ZIP یا 🗜️ RAR (یا CBZ/CBR) — هر ترکیبی از عکس و PDF داخلش رو، به ترتیب اسم، "
-            "توی یه PDF واحد می‌چسبونیم. اگه داخل زیپ یه رار باشه (یا برعکس) "
-            "پوسته‌ی بیرونی رو کنار میزنیم و محتوای داخلی رو برمی‌داریم؛ تا ۳ سطح "
-            "تودرتو، حتی اگه پسوند آرشیو داخلی عوض شده باشه\n"
-            "🖼 یه عکس تکی (به یه PDF تک‌صفحه‌ای تبدیل میشه)\n"
-            "📄 یه فایل PDF (چون از قبل PDFه، فقط مستقیم آپلود میشه)",
-            reply_markup=main_menu()
-        )
-    elif data == "mode_connect":
-        context.user_data["mode"] = "connect"
-        context.user_data["connect_images"] = []
-        context.user_data.pop("connect_status_msg_id", None)
-        await query.edit_message_text(
-            "حالت «اتصال عکس‌ها به PDF» فعال شد ✅\n\n"
-            "عکس‌ها رو یکی‌یکی، به‌صورت «فایل» (Document) بفرست — نه عکس فشرده، "
-            "چون تلگرام موقع فشرده‌سازی اسم فایل رو حذف می‌کنه.\n"
-            "اسم هر عکس باید با شماره باشه (مثل 01.jpg، 02.jpg، ...) — بات بر اساس "
-            "همین شماره‌ها ترتیب صفحات PDF نهایی رو تعیین می‌کنه، نه ترتیب ارسال.\n\n"
-            "وقتی همه رو فرستادی، زیر آخرین عکس دکمه‌ی «✅ تمام» رو بزن."
-        )
+    # دکمه‌های شیشه‌ای قدیمیِ منو (پیام‌های قدیمی که هنوز توی چت مونده)
+    if data in _LEGACY_CALLBACK_TO_MODE:
+        await activate_mode(query.message, context, _LEGACY_CALLBACK_TO_MODE[data])
     elif data == "connect_done":
         async with _user_lock(user_id):
             await handle_connect_done(update, context)
@@ -1962,33 +2037,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("connect_status_msg_id", None)
         await query.edit_message_text("❌ لغو شد.")
         await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-    elif data == "mode_archive":
-        context.user_data["mode"] = "archive_fix"
-        await query.edit_message_text(
-            "حالت «اصلاح و آپلود آرشیو» فعال شد ✅\n\n"
-            "فایل ZIP / RAR / 7z (یا هر فایلی که اسمش با محتواش نمی‌خونه) رو به‌صورت «فایل» بفرست.\n"
-            "به PDF تبدیل نمیشه و لینک هم نمیده؛ خودِ فایل خام برات فرستاده میشه:\n"
-            "🔧 نوع واقعی از روی محتوا تشخیص داده میشه و با پسوند درست فرستاده میشه "
-            "(مثلاً زیپی که در اصل رار بوده → .rar)\n"
-            "🔓 اگه آرشیو فقط یه پوسته بود (زیپ توی رار، رار توی زیپ و ...)، "
-            "پوسته‌ی بیرونی کنار زده میشه و همون آرشیو داخلی به‌صورت فایل برات میاد\n\n"
-            "می‌تونی پشت‌سرهم چند فایل بفرستی.",
-            reply_markup=main_menu()
-        )
     elif data == "mode_menu":
         context.user_data["mode"] = None
-        await query.edit_message_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
-    elif data == "mode_bulk":
-        context.user_data["mode"] = "bulk_upload"
-        _clear_bulk(context.user_data)
-        context.user_data.pop("bulk_status_msg_id", None)
-        await query.edit_message_text(
-            "حالت «آپلود گروهی» فعال شد ✅\n\n"
-            "فایل‌های PDF یا ZIP رو یکی‌یکی (یا پشت‌سرهم) بفرست. هر فایل همون لحظه "
-            "پردازش میشه: ZIP اول به PDF تبدیل میشه، بعد آپلود میشه و لینکش زیر "
-            "همون فایل با اسمش میاد، بعد نوبت فایل بعدیه.\n\n"
-            "برای خروج از این حالت /start رو بزن."
-        )
+        await query.message.reply_text("یکی از حالت‌ها رو انتخاب کن:", reply_markup=main_menu())
     elif data == "bulk_done":
         async with _user_lock(user_id):
             await handle_bulk_done(update, context)
@@ -2131,7 +2182,7 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            file_bytes = bytes(await file_obj.download_as_bytearray())
+            file_bytes = await read_and_free(file_obj)
         except Exception as e:
             await msg.reply_text(f"❌ خطا توی دریافت عکس: {e}")
             return
