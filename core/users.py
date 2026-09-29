@@ -133,6 +133,13 @@ def bump_upload(user_id):
     save_users(USERS)
 
 
+def is_admin(user_id: int) -> bool:
+    if user_id in ADMIN_IDS_SEED:
+        return True
+    info = USERS.get(str(user_id))
+    return bool(info and info.get("is_admin", False))
+
+
 def get_admin_ids():
     ids = {int(uid) for uid, info in USERS.items() if info.get("is_admin")}
     ids |= ADMIN_IDS_SEED
