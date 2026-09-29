@@ -26,8 +26,10 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-COPY bot.py .
-COPY start.sh .
+COPY bot.py start.sh ./
+COPY core ./core
+COPY services ./services
+COPY handlers ./handlers
 RUN chmod +x start.sh
 
 ENV TELEGRAM_API_ID=17349
