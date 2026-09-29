@@ -124,11 +124,13 @@ def register_user(user):
     save_users(USERS)
 
 
-def is_admin(user_id: int) -> bool:
+def bump_upload(user_id):
+    """یکی به شمارنده‌ی آپلودهای موفق این کاربر اضافه می‌کنه (برای بخش آمار)"""
     info = USERS.get(str(user_id))
-    if info is not None:
-        return bool(info.get("is_admin", False)) or user_id in ADMIN_IDS_SEED
-    return user_id in ADMIN_IDS_SEED
+    if info is None:
+        return
+    info["uploads"] = int(info.get("uploads", 0)) + 1
+    save_users(USERS)
 
 
 def get_admin_ids():
