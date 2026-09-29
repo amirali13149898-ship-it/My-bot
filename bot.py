@@ -1,6 +1,7 @@
 """نقطه‌ی ورود ربات"""
 import threading
 import time
+from telegram import Update
 from telegram.error import RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
@@ -8,8 +9,20 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
+
+from core.config import (
+    BOT_TOKEN,
+    IMGUR_CLIENT_ID,
+    LOCAL_BOT_API_URL,
+    USE_LOCAL_BOT_API,
+    USE_SUPABASE,
+)
+from core.keyboards import track_user
+from core.telegram_io import _note_flood
 from telegram.request import HTTPXRequest
 
 from core.config import (
