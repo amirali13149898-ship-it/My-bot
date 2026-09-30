@@ -130,7 +130,14 @@ async def _handle_bulk_file(msg, context, user_id):
         msg.document
         and (
             msg.document.mime_type in ("application/zip", "application/x-zip-compressed")
-            or (msg.document.file_name and msg.document.file_name.lower().endswith(".zip"))
+            or (msg.document.file_name and msg.document.file_name.lower().endswith((".zip", ".cbz")))
+        )
+    )
+    is_rar = (
+        msg.document
+        and (
+            (msg.document.mime_type or "") in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar")
+            or (msg.document.file_name and msg.document.file_name.lower().endswith((".rar", ".cbr")))
         )
     )
     is_img = bool(
@@ -141,8 +148,8 @@ async def _handle_bulk_file(msg, context, user_id):
         )
     )
 
-    if not (is_pdf or is_zip or is_img):
-        await msg.reply_text("⚠️ تو حالت «آپلود گروهی» فقط PDF، ZIP یا عکس (PNG/JPG/WEBP/GIF) قبول میشه.")
+    if not (is_pdf or is_zip or is_rar or is_img):
+        await msg.reply_text("⚠️ تو حالت «آپلود گروهی» فقط PDF، ZIP، RAR یا عکس (PNG/JPG/WEBP/GIF) قبول میشه.")
         return
 
     original_name = msg.document.file_name or "file"
@@ -166,14 +173,16 @@ async def _handle_bulk_file(msg, context, user_id):
         return
 
     note = ""
-    if is_zip:
+    if is_zip or is_rar:
         await _safe_edit(status, f"🛠 در حال تبدیل «{label}» به PDF...")
         try:
-            upload_bytes, stats = await _run_heavy(_archive_to_pdf_with_stats, file_bytes, "zip")
+            upload_bytes, stats = await _run_heavy(
+                _archive_to_pdf_with_stats, file_bytes, "rar" if is_rar else "zip"
+            )
         except Exception as e:
             file_bytes = None
             try:
-                await status.edit_text(f"📄 {safe_label}\n⚠️ خطا در تبدیل زیپ: {html.escape(str(e))}", parse_mode="HTML")
+                await status.edit_text(f"📄 {safe_label}\n⚠️ خطا در تبدیل آرشیو: {html.escape(str(e))}", parse_mode="HTML")
             except Exception:
                 pass
             return
@@ -181,7 +190,7 @@ async def _handle_bulk_file(msg, context, user_id):
         if upload_bytes is None:
             try:
                 await status.edit_text(
-                    f"📄 {safe_label}\n⚠️ هیچ عکس یا PDF معتبری توی زیپ پیدا نشد یا زیپ خراب بود",
+                    f"📄 {safe_label}\n⚠️ هیچ عکس یا PDF معتبری توی آرشیو پیدا نشد یا آرشیو خراب/رمزدار بود",
                     parse_mode="HTML",
                 )
             except Exception:
