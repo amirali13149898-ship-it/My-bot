@@ -8,6 +8,7 @@ from core.users import is_allowed
 from handlers.access import handle_request_access, handle_request_decision
 from handlers.admin import admin_callback_handler
 from handlers.bulk import _clear_bulk, handle_bulk_done
+from handlers.locked import _clear_locked
 
 
 MODE_TEXTS = {
@@ -28,6 +29,15 @@ MODE_TEXTS = {
         "میشه و لینکش زیر همون فایل با اسمش میاد، بعد نوبت فایل بعدیه.\n\n"
         "برای خروج از این حالت /start رو بزن."
     ),
+    "locked": (
+        "حالت «فایل رمزدار» فعال شد 🔐\n\n"
+        "یه فایل PDF، ZIP یا RAR بفرست. اگه رمز داشته باشه رمزش رو ازت می‌پرسم؛ "
+        "اگه رمز درست بود:\n"
+        "📄 PDF ← رمزش برداشته میشه و آپلود میشه\n"
+        "📦 ZIP / 🗜️ RAR ← باز میشه، عکس‌ها و PDFهای داخلش توی یه PDF میرن و آپلود میشن\n\n"
+        "اگه رمز اشتباه باشه بهت خبر میدم و می‌تونی دوباره رمز بفرستی. "
+        "برای انصراف /start رو بزن."
+    ),
 }
 
 # دکمه‌های شیشه‌ایِ قدیمیِ منو (پیام‌های قدیمی که هنوز توی چت مونده)
@@ -45,6 +55,7 @@ async def activate_mode(msg, context, mode):
     """حالت انتخاب‌شده رو فعال می‌کنه و پیام توضیح رو می‌فرسته (با کیبورد کپشنی)."""
     ud = context.user_data
     ud["mode"] = mode
+    _clear_locked(ud)
     if mode == "bulk_upload":
         _clear_bulk(ud)
         ud.pop("bulk_status_msg_id", None)
