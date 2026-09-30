@@ -8,19 +8,10 @@ import re
 import zipfile
 
 
-import rarfile
-from PIL import Image
-
-# rarfile برای استخراج واقعیِ محتوای RAR به یه ابزار خارجی نیاز داره
-# (خودش فقط هدرها رو می‌فهمه، دیکد نمی‌کنه). روی ایمیج آلپاینی ما
-# ابزار bsdtar (از پکیج libarchive-tools توی Dockerfile) نصبه؛ اینجا
-# صریحاً بهش می‌گیم ازش استفاده کنه تا به‌جای auto-detect (که همیشه
-# قابل‌اعتماد نیست) مطمئن باشیم درست پیدا میشه.
 import shutil
-if shutil.which("bsdtar"):
-    rarfile.UNRAR_TOOL = "bsdtar"
-else:
-    print("⚠️ ابزار bsdtar پیدا نشد؛ فایل‌های RAR ممکنه باز نشن (پکیج libarchive-tools رو چک کن).")
+import subprocess
+import tempfile
+from PIL import Image
 
 # ===== پشتیبانی از فرمت‌های اضافه‌ی عکس =====
 # HEIC/HEIF (فرمت پیش‌فرض آیفون) و AVIF از طریق پلاگین به پیلو اضافه
@@ -166,13 +157,110 @@ def _sniff_archive_kind(raw):
     return None
 
 
+class _ExtractedRar:
+    """
+    RAR رو با ابزار خارجی (bsdtar / 7z / unrar) توی یه پوشه‌ی موقت باز می‌کنه
+    و همون رابط zipfile (namelist / read / with) رو ارائه میده. قبلاً از
+    rarfile با bsdtar استفاده می‌شد ولی rarfile دستورهای مخصوص unrar می‌فرسته
+    که bsdtar نمی‌فهمه و باز کردن RAR بی‌صدا شکست می‌خورد.
+    """
+
+    _TIMEOUT = 600
+
+    def __init__(self, raw):
+        self._tmp = tempfile.mkdtemp(prefix="bot_rar_")
+        try:
+            self._out = os.path.join(self._tmp, "out")
+            os.makedirs(self._out)
+            src = os.path.join(self._tmp, "in.rar")
+            with open(src, "wb") as f:
+                f.write(raw)
+            self._extract(src)
+            self._names = self._scan()
+        except BaseException:
+            shutil.rmtree(self._tmp, ignore_errors=True)
+            raise
+
+    def _candidates(self):
+        out = self._out
+        cmds = []
+        exe = shutil.which("bsdtar")
+        if exe:
+            cmds.append(("bsdtar", lambda src, e=exe: [e, "-xf", src, "-C", out]))
+        for cand in ("7zz", "7z", "7za"):
+            exe = shutil.which(cand)
+            if exe:
+                cmds.append((cand, lambda src, e=exe: [e, "x", "-y", f"-o{out}", src]))
+                break
+        exe = shutil.which("unrar")
+        if exe:
+            cmds.append(("unrar", lambda src, e=exe: [e, "x", "-y", "-idq", src, out + os.sep]))
+        return cmds
+
+    def _scan(self):
+        names = []
+        for root, _dirs, files in os.walk(self._out):
+            for fn in files:
+                p = os.path.join(root, fn)
+                if os.path.islink(p):
+                    continue
+                names.append(os.path.relpath(p, self._out).replace(os.sep, "/"))
+        return names
+
+    def _extract(self, src):
+        cmds = self._candidates()
+        if not cmds:
+            raise RuntimeError("هیچ ابزاری برای باز کردن RAR نصب نیست (bsdtar / 7zip / unrar)")
+        errors = []
+        for name, build in cmds:
+            try:
+                res = subprocess.run(
+                    build(src), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=self._TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"{name}: timeout")
+                continue
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                continue
+            # کد ۱ یعنی فقط هشدار (7z/unrar)؛ اگه فایلی درآمده باشه قبول می‌کنیم
+            if res.returncode in (0, 1) and self._scan():
+                return
+            err = (res.stderr or res.stdout or b"").decode("utf-8", "replace").strip()[:300]
+            errors.append(f"{name} (code {res.returncode}): {err}")
+            # پوشه رو برای ابزار بعدی خالی کن
+            shutil.rmtree(self._out, ignore_errors=True)
+            os.makedirs(self._out)
+        raise RuntimeError("باز کردن RAR شکست خورد -> " + " | ".join(errors))
+
+    def namelist(self):
+        return list(self._names)
+
+    def read(self, name):
+        path = os.path.join(self._out, name)
+        with open(path, "rb") as f:
+            return f.read()
+
+    def close(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 def _open_archive(archive_bytes, kind):
     # اول بر اساس محتوای واقعی تشخیص بده؛ فقط اگه امضا ناشناخته بود از
     # kind ای که از پسوند/mime حدس زده شده به‌عنوان fallback استفاده کن.
     actual_kind = _sniff_archive_kind(archive_bytes) or kind
     if actual_kind == "zip":
         return zipfile.ZipFile(io.BytesIO(archive_bytes))
-    return rarfile.RarFile(io.BytesIO(archive_bytes))
+    return _ExtractedRar(archive_bytes)
 
 
 def _classify_entry(name, raw):
