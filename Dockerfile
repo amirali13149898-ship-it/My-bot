@@ -11,7 +11,6 @@ RUN apk add --no-cache \
     jpeg zlib libjpeg-turbo \
     libarchive \
     libarchive-tools \
-    unrar \
     findutils \
     libheif \
     libavif \
@@ -24,6 +23,9 @@ RUN apk add --no-cache \
     && pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
     && apk del .build-deps \
     && rm -rf /root/.cache /tmp/*
+
+# برای باز کردن RAR رمزدار (اگه پکیج پیدا نشه بیلد خراب نمیشه)
+RUN apk add --no-cache 7zip || echo "⚠️ 7zip نصب نشد؛ RAR رمزدار باز نمیشه"
 
 WORKDIR /app
 
