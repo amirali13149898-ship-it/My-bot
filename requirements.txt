@@ -10,3 +10,5 @@ pillow-heif
 pillow-avif-plugin
 rawpy
 cairosvg
+pyzipper
+cryptography
