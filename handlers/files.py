@@ -15,6 +15,7 @@ from core.telegram_io import (
 from core.users import bump_upload, is_allowed
 from handlers.bulk import _label_html
 from handlers.convert_flow import _convert_to_pdf_and_upload, _detect_convert_kind
+from handlers.locked import handle_locked_file
 from handlers.reply import process_and_reply
 from services.converters import _archive_to_pdf_with_stats, _describe_stats
 
@@ -51,6 +52,8 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_single(msg, context)
     elif mode == "bulk_upload":
         await _handle_bulk_file(msg, context, user_id)
+    elif mode == "locked":
+        await handle_locked_file(msg, context)
 
 
 # ==================== آپلود تکی (تشخیص خودکار نوع فایل) ====================
