@@ -6,6 +6,7 @@ from core.keyboards import BTN_ADMIN, BTN_STATS, MENU_LABEL_TO_MODE, main_menu
 from core.users import USERS, is_admin, is_allowed, register_user
 from handlers.admin import admin_menu, build_user_list_keyboard
 from handlers.bulk import _clear_bulk
+from handlers.locked import _clear_locked, handle_locked_password, has_pending_locked
 from handlers.modes import activate_mode
 
 
@@ -46,6 +47,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = None
     context.user_data.pop("awaiting_admin_search", None)
     _clear_bulk(context.user_data)
+    _clear_locked(context.user_data)
     context.user_data.pop("bulk_status_msg_id", None)
     await update.message.reply_text(
         "یکی از گزینه‌ها رو انتخاب کن:",
@@ -88,6 +90,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("بخش مدیریت 👇", reply_markup=admin_menu())
         return
 
+    # حالت «فایل رمزدار»: متن بعد از فایل، همون رمزه
+    if has_pending_locked(context.user_data):
+        await handle_locked_password(update, context)
+        return
+    if context.user_data.get("mode") == "locked" and is_allowed(user_id):
+        await update.message.reply_text("اول فایل رمزدار (PDF / ZIP / RAR) رو بفرست.")
+        return
+
     # بقیه‌ی متن‌ها فقط برای جستجوی آیدی توسط ادمین استفاده میشه
     if is_admin(user_id) and context.user_data.get("awaiting_admin_search"):
         context.user_data.pop("awaiting_admin_search", None)
@@ -106,4 +116,4 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"نتایج جستجو (صفحه {page + 1} از {total_pages}):",
             reply_markup=keyboard
-    )
+        )
