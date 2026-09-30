@@ -11,6 +11,7 @@ RUN apk add --no-cache \
     jpeg zlib libjpeg-turbo \
     libarchive \
     libarchive-tools \
+    unrar \
     findutils \
     libheif \
     libavif \
