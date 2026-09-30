@@ -8,6 +8,7 @@ from core.users import is_admin
 
 BTN_SINGLE = "📤 آپلود تکی"
 BTN_BULK = "📚 آپلود گروهی"
+BTN_LOCKED = "🔐 فایل رمزدار"
 BTN_STATS = "📊 آمار"
 BTN_ADMIN = "⚙️ مدیریت"
 
@@ -15,6 +16,7 @@ BTN_ADMIN = "⚙️ مدیریت"
 MENU_LABEL_TO_MODE = {
     BTN_SINGLE: "single",
     BTN_BULK: "bulk_upload",
+    BTN_LOCKED: "locked",
 }
 
 # آیدی کاربرِ آپدیت جاری. با این، main_menu() همه‌جا (بدون تغییر توی بقیه‌ی فایل‌ها)
@@ -31,9 +33,9 @@ def main_menu(user_id=None):
     if user_id is None:
         user_id = _CURRENT_USER_ID.get()
 
-    rows = [[BTN_SINGLE, BTN_BULK], [BTN_STATS]]
+    rows = [[BTN_SINGLE, BTN_BULK], [BTN_LOCKED, BTN_STATS]]
     if user_id is not None and is_admin(user_id):
-        rows[1].append(BTN_ADMIN)
+        rows.append([BTN_ADMIN])
 
     return ReplyKeyboardMarkup(
         rows,
