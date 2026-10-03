@@ -21,6 +21,7 @@ from core.config import (
     USE_LOCAL_BOT_API,
     USE_SUPABASE,
 )
+from core.dbcheck import supabase_selftest
 from core.keyboards import track_user
 from core.telegram_io import _note_flood
 from core.webserver import run_web
@@ -82,7 +83,7 @@ def build_app():
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.ANIMATION, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app
@@ -103,6 +104,7 @@ def main():
     else:
         print("⚠️ IMGUR_CLIENT_ID ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
 
+    supabase_selftest()
     threading.Thread(target=run_web, daemon=True).start()
 
     # اگه تلگرام همون اول (initialize/get_me/getUpdates) RetryAfter بده، قبلاً
