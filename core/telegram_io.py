@@ -14,6 +14,7 @@ from core.tasks import (
     _new_task,
     cancel_keyboard,
 )
+from core.fun import cleanup_fun
 from services.uploaders import upload_catbox
 
 
@@ -77,7 +78,7 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
     if owns_task:
         task_id = _new_task(status_msg.chat_id)
     state = _TASKS[task_id]
-    kb = cancel_keyboard(task_id)
+    kb = cancel_keyboard(task_id, fun=True)
 
     try:
         # ---- صف مشترک بین همه‌ی کاربرها ----
@@ -137,6 +138,7 @@ async def upload_catbox_with_progress(filename, file_bytes, status_msg, prefix="
             _UPLOAD_SEM.release()
     finally:
         if owns_task:
+            await cleanup_fun(status_msg.get_bot(), task_id)
             _end_task(task_id)
 
 
