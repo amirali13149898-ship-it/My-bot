@@ -75,7 +75,7 @@ def _write_users(snapshot, seq):
                 )
                 r.raise_for_status()
             except Exception as e:
-                print(f"⚠️ ذخیره در Supabase با خطا مواجه شد: {e}")
+                print(f"⚠️ ذخیره در Supabase با خطا مواجه شد: {e} | {getattr(getattr(e, 'response', None), 'text', '')[:300]}")
             return
 
         # حالت پشتیبان: فایل محلی (روی رندر رایگان دائمی نیست!)
