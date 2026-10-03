@@ -8,6 +8,7 @@ from core.users import is_allowed
 from handlers.access import handle_request_access, handle_request_decision
 from handlers.admin import admin_callback_handler
 from handlers.bulk import _clear_bulk, handle_bulk_done
+from handlers.fun import handle_fun_callback
 from handlers.locked import _clear_locked
 
 
@@ -82,6 +83,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_allowed(user_id):
         await query.answer("⛔ شما اجازه استفاده از این ربات رو ندارید.", show_alert=True)
+        return
+
+    # دکمه‌ی «🎭 سرگرمی» حین آپلود (بدون قفل کاربر تا وسط آپلود هم کار کنه)
+    if data.startswith("fun_"):
+        await handle_fun_callback(update, context, data)
         return
 
     # دکمه‌ی «❌ لغو» زیر پیام‌های دریافت/آپلود
