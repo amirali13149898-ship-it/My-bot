@@ -19,6 +19,7 @@ def admin_menu():
         [InlineKeyboardButton("📋 لیست کاربران", callback_data="admin_list_0")],
         [InlineKeyboardButton("🔍 جستجوی آیدی", callback_data="admin_search")],
         [InlineKeyboardButton("👑 مدیریت ادمین‌ها", callback_data="admin_admins_0")],
+        [InlineKeyboardButton("🎭 مدیریت سرگرمی", callback_data="admin_fun")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -129,7 +130,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     await query.answer()
 
+    if data.startswith("admin_fun"):
+        from handlers.fun import admin_fun_callback
+        await admin_fun_callback(update, context, data)
+        return
+
     if data == "admin_back":
+        context.user_data.pop("awaiting_fun", None)
         context.user_data.pop("admin_filtered_ids", None)
         context.user_data.pop("awaiting_admin_search", None)
         await query.edit_message_text("بخش مدیریت 👇", reply_markup=admin_menu())
