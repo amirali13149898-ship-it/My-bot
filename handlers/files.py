@@ -12,7 +12,8 @@ from core.telegram_io import (
     download_with_progress,
     upload_catbox_with_progress,
 )
-from core.users import bump_upload, is_allowed
+from core.users import bump_upload, is_admin, is_allowed
+from handlers.fun import fun_admin_receive
 from handlers.bulk import _label_html
 from handlers.convert_flow import _convert_to_pdf_and_upload, _detect_convert_kind
 from handlers.locked import handle_locked_file
@@ -37,6 +38,15 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_allowed(user_id):
         await msg.reply_text("⛔ شما اجازه استفاده از این ربات رو ندارید.")
+        return
+
+    # ادمین وسط افزودن محتوای سرگرمی (عکس/ویدیو/گیف)
+    if context.user_data.get("awaiting_fun") and is_admin(user_id):
+        await fun_admin_receive(update, context)
+        return
+
+    if not (msg.document or msg.photo):
+        await msg.reply_text("⚠️ این نوع فایل پشتیبانی نمیشه. عکس، PDF، ZIP یا RAR بفرست.")
         return
 
     mode = context.user_data.get("mode")
