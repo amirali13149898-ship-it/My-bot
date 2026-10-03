@@ -33,6 +33,7 @@ COPY bot.py start.sh ./
 COPY core ./core
 COPY services ./services
 COPY handlers ./handlers
+COPY data ./data
 RUN chmod +x start.sh
 
 ENV TELEGRAM_API_ID=17349
