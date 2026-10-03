@@ -7,6 +7,7 @@ from core.users import USERS, is_admin, is_allowed, register_user
 from handlers.admin import admin_menu, build_user_list_keyboard
 from handlers.bulk import _clear_bulk
 from handlers.locked import _clear_locked, handle_locked_password, has_pending_locked
+from handlers.fun import fun_admin_receive
 from handlers.modes import activate_mode
 
 
@@ -46,6 +47,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["mode"] = None
     context.user_data.pop("awaiting_admin_search", None)
+    context.user_data.pop("awaiting_fun", None)
     _clear_bulk(context.user_data)
     _clear_locked(context.user_data)
     context.user_data.pop("bulk_status_msg_id", None)
@@ -63,6 +65,13 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
+
+    # ادمین وسط افزودن محتوای سرگرمی: متن بعدی همون محتواست (مگه دکمه‌ی منو بزنه)
+    if text in MENU_LABEL_TO_MODE or text in (BTN_STATS, BTN_ADMIN):
+        context.user_data.pop("awaiting_fun", None)
+    elif context.user_data.get("awaiting_fun") and is_admin(user_id):
+        await fun_admin_receive(update, context)
+        return
 
     # آپلود تکی / آپلود گروهی
     if text in MENU_LABEL_TO_MODE:
