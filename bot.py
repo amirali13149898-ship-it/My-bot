@@ -15,9 +15,11 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from core.config import (
+    ADMIN_IDS_SEED,
     BOT_TOKEN,
     IMGUR_CLIENT_ID,
     LOCAL_BOT_API_URL,
+    SITE_ENABLED,
     USE_LOCAL_BOT_API,
     USE_SUPABASE,
 )
@@ -103,6 +105,13 @@ def main():
         print("✅ کاورها روی Imgur آپلود میشن (بدون فیلتر توی ایران).")
     else:
         print("⚠️ IMGUR_CLIENT_ID ست نشده - کاورها فعلاً روی Catbox آپلود میشن.")
+
+    if SITE_ENABLED:
+        print("✅ اتصال به سایت تنظیم شده (BASE_URL + BOT_SECRET_KEY).")
+    else:
+        print("⚠️ BASE_URL یا BOT_SECRET_KEY ست نشده - بخش ثبت چپتر/مانهوا روی سایت کار نمی‌کنه.")
+    if not ADMIN_IDS_SEED:
+        print("⚠️ ADMIN_IDS ست نشده - هیچ‌کس اجازه‌ی ثبت روی سایت رو نداره.")
 
     supabase_selftest()
     threading.Thread(target=run_web, daemon=True).start()
