@@ -2,6 +2,8 @@
 import asyncio
 import gc
 import os
+import time
+import zipfile
 
 from core.tasks import TaskCancelled, _run_heavy
 from core.telegram_io import download_with_progress, upload_catbox_with_progress
@@ -12,6 +14,32 @@ from services.converters import _archive_to_pdf_with_stats, _open_archive
 from services.multi_split import list_inner_chapters, parse_range
 
 MAX_LISTED = 30  # سقف تعداد خط‌ها توی گزارش
+OPEN_TIMEOUT = 420     # ثانیه: سقف باز کردن آرشیو بیرونی (RAR حجیم روی CPU ضعیف کنده)
+LIST_TIMEOUT = 120     # ثانیه: سقف خوندن لیست فایل‌های داخلش
+HEARTBEAT = 10         # ثانیه: هر چند ثانیه یه بار پیام «هنوز زنده‌ام» ادیت بشه
+
+
+async def _with_heartbeat(status, text, coro, timeout):
+    """
+    کار سنگین رو اجرا می‌کنه و تا تموم شدنش هر HEARTBEAT ثانیه زمان سپری‌شده رو توی
+    پیام نشون میده (تا گیر کردن از «در حال کار» قابل تشخیص باشه). اگه از timeout
+    بیشتر طول بکشه asyncio.TimeoutError پرتاب میشه.
+    """
+    task = asyncio.ensure_future(coro)
+    start = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT)
+            if done:
+                return task.result()
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError()
+            await edit(status, f"{text}\n⏱ {int(elapsed)} ثانیه گذشته")
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        raise
 
 
 def _compact(numbers):
@@ -38,19 +66,46 @@ async def handle(msg, context, session, doc, kind):
         return
 
     try:
-        await edit(status, f"📦 در حال باز کردن <b>{safe_outer}</b>...")
+        size_mb = len(raw) / 1e6
+        print(f"📦 [multi] دانلود {orig} تموم شد ({size_mb:.0f}MB, {kind}) - شروع باز کردن")
+        open_text = f"📦 در حال باز کردن <b>{safe_outer}</b> ({size_mb:.0f} مگابایت)..."
+        await edit(status, open_text)
         try:
-            archive = await _run_heavy(_open_archive, raw, kind)
+            archive = await _with_heartbeat(
+                status, open_text, _run_heavy(_open_archive, raw, kind), OPEN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            print(f"⚠️ [multi] باز کردن {orig} بیشتر از {OPEN_TIMEOUT} ثانیه طول کشید")
+            await edit(
+                status,
+                f"⏱ باز کردن <b>{safe_outer}</b> بیشتر از {OPEN_TIMEOUT // 60} دقیقه طول کشید و متوقف شد.\n"
+                "فایل خیلی حجیمه یا سرور سرش شلوغه؛ فایل رو کوچیک‌تر (مثلاً ۵ چپتر) بفرست.",
+            )
+            return
         except Exception as e:
+            print(f"⚠️ [multi] باز کردن {orig} شکست خورد: {e!r}")
             await edit(status, f"⚠️ فایل <b>{safe_outer}</b> باز نشد (خراب یا رمزدار؟).\n{esc(e)}")
             return
 
+        # RAR روی دیسک استخراج شده؛ دیگه نیازی به نگه داشتن کل فایل توی رم نیست
+        if not isinstance(archive, zipfile.ZipFile):
+            raw = None
+            gc.collect()
+
         with archive:
             try:
-                entries = await asyncio.to_thread(list_inner_chapters, archive)
+                entries = await _with_heartbeat(
+                    status, f"📦 در حال خوندن محتوای <b>{safe_outer}</b>...",
+                    asyncio.to_thread(list_inner_chapters, archive), LIST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                await edit(status, f"⏱ خوندن محتوای <b>{safe_outer}</b> بیش از حد طول کشید.")
+                return
             except Exception as e:
+                print(f"⚠️ [multi] خوندن محتوای {orig} شکست خورد: {e!r}")
                 await edit(status, f"⚠️ محتوای <b>{safe_outer}</b> خونده نشد.\n{esc(e)}")
                 return
+            print(f"📦 [multi] {orig}: {len(entries)} فایل چپتر پیدا شد")
             if not entries:
                 await edit(
                     status,
