@@ -36,11 +36,8 @@ def _end_task(task_id):
     _TASKS.pop(task_id, None)
 
 
-def cancel_keyboard(task_id, fun=False):
+def cancel_keyboard(task_id):
     row = [InlineKeyboardButton("❌ لغو", callback_data=f"cancel_task_{task_id}")]
-    if fun:
-        # دکمه‌ی سرگرمی فقط زیر پیام «در حال آپلود» میاد
-        row.append(InlineKeyboardButton("🎭 سرگرمی", callback_data=f"fun_next_{task_id}"))
     return InlineKeyboardMarkup([row])
 
 

@@ -155,3 +155,11 @@ def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
+
+
+def is_site_admin(user_id: int) -> bool:
+    """
+    فقط شناسه‌هایی که توی Environment Variable به اسم ADMIN_IDS هستن اجازه‌ی
+    ثبت/انتشار روی سایت رو دارن (ادمینِ اضافه‌شده از پنل ربات این اجازه رو نداره).
+    """
+    return user_id in ADMIN_IDS_SEED

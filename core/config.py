@@ -80,3 +80,21 @@ CATBOX_MAX_CONCURRENT = _env_int("CATBOX_MAX_CONCURRENT", 2)
 CONVERT_MAX_CONCURRENT = _env_int("CONVERT_MAX_CONCURRENT", 1)
 UPLOAD_RETRIES = 3  # هر آپلود تا ۳ بار تلاش میشه
 TELEGRAM_FILE_TIMEOUT = 900  # ثانیه - سقف انتظار برای get_file فایل‌های حجیم
+
+
+# ===== اتصال به سایت (API ادمین محتوا) =====
+# آدرس پایه‌ی سایت (مثلاً https://manhwamoon.com) و کلید امنیتی ربات.
+# هر دو از Environment Variable خونده میشن و کلید توی هدر
+# X-Bot-Secret-Key همه‌ی درخواست‌ها به سایت فرستاده میشه.
+BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
+BOT_SECRET_KEY = os.environ.get("BOT_SECRET_KEY", "").strip()
+SITE_ENABLED = bool(BASE_URL and BOT_SECRET_KEY)
+SITE_TIMEOUT = 30  # ثانیه - سقف انتظار برای هر درخواست به سایت
+SITE_GET_RETRIES = 3
+
+# کاورهای «ثبت مانهوای جدید» روی کدوم میزبان آپلود بشن: catbox (پیش‌فرض) یا imgur
+COVER_HOST = os.environ.get("COVER_HOST", "catbox").strip().lower()
+
+# بعد از آخرین فایلِ پردازش‌شده چند ثانیه صبر کنیم و بعد «اتمام / ادامه» رو نشون بدیم
+# (تا وسط ارسال پشت‌سرهم فایل‌ها پیام نیاد)
+SITE_PROMPT_DELAY = 2.5
