@@ -5,10 +5,10 @@ from telegram.ext import ContextTypes
 from core.keyboards import main_menu
 from core.tasks import _TASKS, _user_lock
 from core.users import is_allowed
+from handlers import site
 from handlers.access import handle_request_access, handle_request_decision
 from handlers.admin import admin_callback_handler
 from handlers.bulk import _clear_bulk, handle_bulk_done
-from handlers.fun import handle_fun_callback
 from handlers.locked import _clear_locked
 
 
@@ -55,6 +55,7 @@ _LEGACY_CALLBACK_TO_MODE = {
 async def activate_mode(msg, context, mode):
     """حالت انتخاب‌شده رو فعال می‌کنه و پیام توضیح رو می‌فرسته (با کیبورد کپشنی)."""
     ud = context.user_data
+    site.clear(ud)  # اگه وسط یه جریانِ سایت بود، بسته میشه
     ud["mode"] = mode
     _clear_locked(ud)
     if mode == "bulk_upload":
@@ -85,9 +86,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ شما اجازه استفاده از این ربات رو ندارید.", show_alert=True)
         return
 
-    # دکمه‌ی «🎭 سرگرمی» حین آپلود (بدون قفل کاربر تا وسط آپلود هم کار کنه)
-    if data.startswith("fun_"):
-        await handle_fun_callback(update, context, data)
+    # دکمه‌های بخش «ادمین محتوای سایت»
+    if data.startswith("sx_"):
+        await site.handle_callback(update, context, data)
         return
 
     # دکمه‌ی «❌ لغو» زیر پیام‌های دریافت/آپلود

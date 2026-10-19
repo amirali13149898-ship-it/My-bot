@@ -2,12 +2,21 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from core.keyboards import BTN_ADMIN, BTN_STATS, MENU_LABEL_TO_MODE, main_menu
-from core.users import USERS, is_admin, is_allowed, register_user
+from core.keyboards import (
+    BTN_ADMIN,
+    BTN_BACK_SITE,
+    BTN_MANUAL,
+    BTN_STATS,
+    MENU_LABEL_TO_MODE,
+    SITE_FLOW_BUTTONS,
+    main_menu,
+    set_manual_menu,
+)
+from core.users import USERS, is_admin, is_allowed, is_site_admin, register_user
+from handlers import site
 from handlers.admin import admin_menu, build_user_list_keyboard
 from handlers.bulk import _clear_bulk
 from handlers.locked import _clear_locked, handle_locked_password, has_pending_locked
-from handlers.fun import fun_admin_receive
 from handlers.modes import activate_mode
 
 
@@ -45,9 +54,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    site.clear(context.user_data)
+    set_manual_menu(user.id, False)
     context.user_data["mode"] = None
     context.user_data.pop("awaiting_admin_search", None)
-    context.user_data.pop("awaiting_fun", None)
     _clear_bulk(context.user_data)
     _clear_locked(context.user_data)
     context.user_data.pop("bulk_status_msg_id", None)
@@ -66,14 +76,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
 
-    # ادمین وسط افزودن محتوای سرگرمی: متن بعدی همون محتواست (مگه دکمه‌ی منو بزنه)
-    if text in MENU_LABEL_TO_MODE or text in (BTN_STATS, BTN_ADMIN):
-        context.user_data.pop("awaiting_fun", None)
-    elif context.user_data.get("awaiting_fun") and is_admin(user_id):
-        await fun_admin_receive(update, context)
+    # ===== منوی اصلی ادمین: ثبت چپتر/مانهوا روی سایت =====
+    if text in SITE_FLOW_BUTTONS:
+        await site.open_flow(SITE_FLOW_BUTTONS[text], update, context)
         return
 
-    # آپلود تکی / آپلود گروهی
+    if text == BTN_MANUAL:
+        if not is_site_admin(user_id):
+            await update.message.reply_text("⛔ این بخش فقط برای ادمین اصلی ربات فعاله.")
+            return
+        site.clear(context.user_data)
+        context.user_data["mode"] = None
+        set_manual_menu(user_id, True)
+        await update.message.reply_text(
+            "حالت «آپلود دستی» 📁\nیکی از گزینه‌ها رو انتخاب کن:", reply_markup=main_menu(user_id)
+        )
+        return
+
+    if text == BTN_BACK_SITE:
+        if not is_site_admin(user_id):
+            return
+        site.clear(context.user_data)
+        context.user_data["mode"] = None
+        _clear_bulk(context.user_data)
+        _clear_locked(context.user_data)
+        set_manual_menu(user_id, False)
+        await update.message.reply_text("منوی اصلی 👇", reply_markup=main_menu(user_id))
+        return
+
+    # آپلود تکی / آپلود گروهی (دستی)
     if text in MENU_LABEL_TO_MODE:
         if not is_allowed(user_id):
             await update.message.reply_text("⛔ شما اجازه استفاده از این ربات رو ندارید.")
@@ -98,6 +129,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_admin_search", None)
         await update.message.reply_text("بخش مدیریت 👇", reply_markup=admin_menu())
         return
+
+    # جواب‌های متنیِ جریان‌های سایت (نام مانهوا، شماره‌ی چپتر، فیلدهای مانهوای جدید)
+    if context.user_data.get("site") and is_site_admin(user_id):
+        if await site.handle_text(update, context):
+            return
 
     # حالت «فایل رمزدار»: متن بعد از فایل، همون رمزه
     if has_pending_locked(context.user_data):
