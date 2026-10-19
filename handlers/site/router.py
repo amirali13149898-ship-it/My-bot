@@ -163,6 +163,8 @@ async def _dispatch(query, context, session, data):
 
     # ---- چپترها
     if session["kind"] in ("bulk", "single"):
+        if data in ("sx_m_multi", "sx_m_single"):
+            return await chapters.cb_mode(query, context, session, data == "sx_m_multi")
         table = {
             "sx_more": chapters.cb_more,
             "sx_add": chapters.cb_more,
