@@ -18,6 +18,7 @@ from handlers.site.common import (
     reply_to,
     send,
 )
+from handlers.site import multi
 from handlers.site.pipeline import PipelineError, file_to_pdf_link
 from services.chapter_detect import (
     detect_chapter_number,
@@ -33,7 +34,8 @@ REVIEW_LIMIT = 3500  # سقف طول متن بررسی (تلگرام ۴۰۹۶)
 # ================================================================ شروع جریان
 async def begin(context, session, manhwa):
     """بعد از انتخاب مانهوا: چپترهای موجود رو می‌گیره و منتظر فایل می‌مونه."""
-    session.update(manhwa=manhwa, items=[], failed=[], skipped=[], pending=0, step="files")
+    session.update(manhwa=manhwa, items=[], failed=[], skipped=[], pending=0,
+                   step="files", multi=False)
 
     note = ""
     try:
@@ -44,16 +46,39 @@ async def begin(context, session, manhwa):
         note = ("\n⚠️ لیست چپترهای موجود گرفته نشد؛ تکراری‌ها موقع ثبت توسط سایت چک میشن."
                 f"\n({esc(e)})")
 
+    head = f"✅ مانهوا: <b>{esc(manhwa['title'])}</b>{note}\n\n"
     if session["kind"] == "single":
-        ask = "یه فایل (PDF / ZIP / RAR) بفرست."
+        await send(context, session, head + "یه فایل (PDF / ZIP / RAR) بفرست.",
+                   Markup([cancel_row()]))
+        return
+
+    # آپلود گروهی: اول می‌پرسیم فایل چندچپتری هم داره یا نه
+    session["step"] = "mode"
+    await send(
+        context, session,
+        head + "فایل چندچپتری هم می‌خوای بفرستی؟\n"
+        "(یعنی یه آرشیو مثل 11-20 که داخلش چند فایل چپتر هست)",
+        Markup([
+            [Btn("📦 بله، چندچپتری", callback_data="sx_m_multi"),
+             Btn("📄 نه، فایل‌های جدا", callback_data="sx_m_single")],
+            cancel_row(),
+        ]),
+    )
+
+
+async def cb_mode(query, context, session, multi_mode):
+    if session["step"] != "mode":
+        return
+    session["multi"] = multi_mode
+    session["step"] = "files"
+    if multi_mode:
+        ask = ("📦 فایل چندچپتری (ZIP / RAR) رو بفرست.\n"
+               "داخلش باید برای هر چپتر یه ZIP / RAR / PDF جدا باشه که شماره‌ی چپتر "
+               "توی اسمش هست (مثل Ch018). هر چپتر جدا PDF و آپلود میشه.")
     else:
         ask = ("فایل‌ها رو (PDF / ZIP / RAR) یکی‌یکی یا پشت‌سرهم بفرست؛ "
                "هر کدوم به‌ترتیب پردازش و آپلود میشه.")
-    await send(
-        context, session,
-        f"✅ مانهوا: <b>{esc(manhwa['title'])}</b>{note}\n\n{ask}",
-        Markup([cancel_row()]),
-    )
+    await edit(query.message, f"{esc(query.message.text)}\n\n{esc(ask)}", Markup([cancel_row()]))
 
 
 # ================================================================ دریافت فایل‌ها
@@ -100,6 +125,9 @@ async def handle_file(msg, context, session):
     if step == "pick":
         await msg.reply_text("اول مانهوا رو انتخاب کن 👆")
         return
+    if step == "mode":
+        await msg.reply_text("اول مشخص کن فایل چندچپتری داری یا نه 👆")
+        return
     if step == "submitting":
         await msg.reply_text("⏳ در حال ثبت روی سایت هستم؛ چند لحظه صبر کن.")
         return
@@ -119,6 +147,14 @@ async def handle_file(msg, context, session):
     kind = _detect_convert_kind(msg)
     if kind is None:
         await msg.reply_text("⚠️ فقط PDF، ZIP، RAR (یا CBZ/CBR) یا عکس قبول میشه.")
+        return
+
+    # حالت چندچپتری: هر فایل یه آرشیو بیرونیه که داخلش چپترها جدا هستن
+    if session.get("multi"):
+        if kind not in ("zip", "rar"):
+            await msg.reply_text("⚠️ فایل چندچپتری باید ZIP یا RAR باشه.")
+            return
+        await multi.handle(msg, context, session, doc, kind)
         return
 
     orig = doc.file_name or "file"
