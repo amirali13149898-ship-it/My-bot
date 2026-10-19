@@ -1,8 +1,0 @@
-فقط این 4 فایل نسبت به نسخه‌ی قبلی عوض شدن/جدید هستن:
-
-handlers/site/chapters.py   (جایگزین کن)
-handlers/site/router.py     (جایگزین کن)
-handlers/site/multi.py      (جدید - توی پوشه handlers/site)
-services/multi_split.py     (جدید - توی پوشه services)
-
-بقیه‌ی فایل‌ها همون قبلی‌ان (لیست کامل توی پیام قبلی: bot.py، core/*، handlers/*، services/site_api.py، chapter_detect.py، handlers/site/*).
