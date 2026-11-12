@@ -63,3 +63,21 @@ def list_inner_chapters(archive):
         _natural_sort_key(e[0]),
     ))
     return entries
+
+
+def is_multichapter(entries, outer_label=""):
+    """
+    تشخیص خودکار: آیا این آرشیو چند چپتر جداست (نه یه چپترِ معمولی که فقط عکس داره)؟
+    entries: خروجی list_inner_chapters.
+    - اسم فایل بازه داشته باشه (مثل 11-20) و حداقل ۲ فایل چپتر داخلش باشه ← چندچپتری
+    - حداقل ۲ آرشیو ZIP/RAR داخلش باشه ← چندچپتری
+    - حداقل ۲ PDF با شماره‌ی چپترِ متفاوت داخلش باشه ← چندچپتری
+    """
+    if len(entries) < 2:
+        return False
+    if parse_range(outer_label):
+        return True
+    if sum(1 for _n, k, _num in entries if k in ("zip", "rar")) >= 2:
+        return True
+    pdf_numbers = [num for _n, k, num in entries if k == "pdf"]
+    return len(pdf_numbers) >= 2 and None not in pdf_numbers and len(set(pdf_numbers)) == len(pdf_numbers)
