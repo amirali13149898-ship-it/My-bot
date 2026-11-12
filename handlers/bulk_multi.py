@@ -68,6 +68,7 @@ async def try_handle(msg, context, status, raw, kind, orig_name, user_id):
                     results.append((inner_label, number, None, "هیچ عکس یا PDF معتبری داخلش نبود"))
                     continue
                 link = await upload_catbox_with_progress(f"{inner_label}.pdf", data, status, prefix=prefix)
+                await asyncio.sleep(3)  # فاصله بین آپلودها تا Catbox فایل خالی ذخیره نکنه
                 data = None
                 if link:
                     bump_upload(user_id)
