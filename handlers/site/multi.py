@@ -11,7 +11,7 @@ from core.users import bump_upload
 from handlers.site.common import edit, esc, reply_to
 from services.chapter_detect import fmt_num
 from services.converters import _archive_to_pdf_with_stats, _open_archive
-from services.multi_split import list_inner_chapters, parse_range
+from services.multi_split import ensure_valid_pdf, list_inner_chapters, parse_range
 
 MAX_LISTED = 30  # سقف تعداد خط‌ها توی گزارش
 OPEN_TIMEOUT = 420     # ثانیه: سقف باز کردن آرشیو بیرونی (RAR حجیم روی CPU ضعیف کنده)
@@ -142,7 +142,7 @@ async def _process_entries(msg, context, session, status, archive, entries, oute
         try:
             inner = await asyncio.to_thread(archive.read, name)
             if ikind == "pdf":
-                data = inner
+                data = ensure_valid_pdf(inner)
             else:
                 data, _stats = await _run_heavy(_archive_to_pdf_with_stats, inner, ikind)
             inner = None
