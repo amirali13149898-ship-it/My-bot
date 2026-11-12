@@ -100,6 +100,7 @@ def upload_catbox(filename, file_bytes, progress_cb=None):
             text = (r.text or "").strip()
             if r.status_code == 200 and text.startswith("http"):
                 ok = _verify_remote_size(text, file_bytes)
+                print(f"🔎 Catbox verify {filename}: {len(file_bytes)} bytes -> {ok} ({text})")
                 if ok is not False:
                     return text
                 print(f"⚠️ Catbox فایل ناقص/خالی ذخیره کرد ({filename}) -> آپلود دوباره")

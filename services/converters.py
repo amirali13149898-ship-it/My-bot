@@ -184,9 +184,7 @@ class _ExtractedRar:
     def _candidates(self):
         out = self._out
         cmds = []
-        exe = shutil.which("bsdtar")
-        if exe:
-            cmds.append(("bsdtar", lambda src, e=exe: [e, "-xf", src, "-C", out]))
+        # 7z اول: RAR5 و آرشیوهای حجیم رو دقیق‌تر از bsdtar باز می‌کنه و کد خروجیش قابل‌اعتمادتره
         for cand in ("7zz", "7z", "7za"):
             exe = shutil.which(cand)
             if exe:
@@ -195,6 +193,9 @@ class _ExtractedRar:
         exe = shutil.which("unrar")
         if exe:
             cmds.append(("unrar", lambda src, e=exe: [e, "x", "-y", "-idq", src, out + os.sep]))
+        exe = shutil.which("bsdtar")
+        if exe:
+            cmds.append(("bsdtar", lambda src, e=exe: [e, "-xf", src, "-C", out]))
         return cmds
 
     def _scan(self):
@@ -212,6 +213,7 @@ class _ExtractedRar:
         if not cmds:
             raise RuntimeError("هیچ ابزاری برای باز کردن RAR نصب نیست (bsdtar / 7zip / unrar)")
         errors = []
+        partial = None  # ابزاری که با هشدار (کد ۱) چیزی درآورد؛ فقط اگه هیچ ابزار دیگه‌ای کامل باز نکرد
         for name, build in cmds:
             try:
                 res = subprocess.run(
@@ -225,14 +227,23 @@ class _ExtractedRar:
             except Exception as e:
                 errors.append(f"{name}: {e}")
                 continue
-            # کد ۱ یعنی فقط هشدار (7z/unrar)؛ اگه فایلی درآمده باشه قبول می‌کنیم
-            if res.returncode in (0, 1) and self._scan():
+            # فقط کد ۰ یعنی کامل باز شد. کد ۱ = هشدار/ناقص: ممکنه بعضی فایل‌ها خالی یا نصفه درآمده باشن
+            if res.returncode == 0 and self._scan():
                 return
+            if res.returncode == 1 and self._scan() and partial is None:
+                partial = (name, build)
             err = (res.stderr or res.stdout or b"").decode("utf-8", "replace").strip()[:300]
             errors.append(f"{name} (code {res.returncode}): {err}")
-            # پوشه رو برای ابزار بعدی خالی کن
+            print(f"⚠️ باز کردن RAR با {name} کامل نبود (code {res.returncode}): {err[:150]}")
             shutil.rmtree(self._out, ignore_errors=True)
             os.makedirs(self._out)
+        if partial:
+            name, build = partial
+            print(f"⚠️ RAR با هشدار باز شد ({name}) - بعضی فایل‌ها ممکنه ناقص باشن")
+            subprocess.run(build(src), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=self._TIMEOUT)
+            if self._scan():
+                return
         raise RuntimeError("باز کردن RAR شکست خورد -> " + " | ".join(errors))
 
     def namelist(self):

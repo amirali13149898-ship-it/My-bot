@@ -81,3 +81,35 @@ def is_multichapter(entries, outer_label=""):
         return True
     pdf_numbers = [num for _n, k, num in entries if k == "pdf"]
     return len(pdf_numbers) >= 2 and None not in pdf_numbers and len(set(pdf_numbers)) == len(pdf_numbers)
+
+
+def ensure_valid_pdf(data):
+    """
+    قبل از آپلود چک می‌کنه PDF واقعاً باز میشه. اگه سالم بود همون بایت‌ها برمی‌گرده؛
+    اگه ساختارش خراب بود (مثلاً ناقص) سعی می‌کنه با بازنویسی ترمیمش کنه؛
+    اگه قابل‌ترمیم نبود ValueError پرتاب میشه (تا لینکِ فایل خراب به کاربر داده نشه).
+    """
+    import io
+    import pypdf
+
+    if not data or data[:5] != b"%PDF-":
+        raise ValueError("فایل خالی یا PDF معتبر نیست (احتمالاً موقع باز کردن آرشیو درست استخراج نشده)")
+    if b"%%EOF" not in data[-2048:]:
+        raise ValueError("PDF ناقصه (انتهای فایل نیست)؛ احتمالاً موقع باز کردن آرشیو نصفه استخراج شده")
+    try:
+        if len(pypdf.PdfReader(io.BytesIO(data)).pages) > 0:
+            return data
+    except Exception:
+        pass
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data), strict=False)
+        writer = pypdf.PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        if not len(writer.pages):
+            raise ValueError("PDF صفحه‌ای نداره")
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception as e:
+        raise ValueError(f"PDF خراب بود و ترمیم نشد: {e}")
