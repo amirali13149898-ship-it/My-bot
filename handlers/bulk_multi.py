@@ -10,19 +10,20 @@ from core.telegram_io import _safe_edit, upload_catbox_with_progress
 from core.users import bump_upload
 from services.chapter_detect import fmt_num
 from services.converters import _archive_to_pdf_with_stats, _open_archive
-from services.multi_split import is_multichapter, list_inner_chapters, parse_range
+from services.multi_split import ensure_valid_pdf, is_multichapter, list_inner_chapters, parse_range
 
 OPEN_TIMEOUT = 420
 LIST_TIMEOUT = 120
 MAX_MSG = 3500
 
 
-def _line(label, number, link=None, error=None):
+def _line(label, number, link=None, error=None, size=None):
     """شماره داخل <code> میاد تا با یه تپ کپی بشه؛ لینک هم همین‌طور."""
     head = "📄 چپتر <code>%s</code>" % fmt_num(number) if number is not None else "📄 ❓ شماره نامشخص"
     head += f" — {html.escape(label)}"
     if link:
-        return f"{head}\n<code>{link}</code>"
+        sz = f" ({size / 1e6:.2f} MB)" if size else ""
+        return f"{head}{sz}\n<code>{link}</code>"
     return f"{head}\n⚠️ {html.escape(error or 'ناموفق')}"
 
 
@@ -60,7 +61,7 @@ async def try_handle(msg, context, status, raw, kind, orig_name, user_id):
                 await _safe_edit(status, f"🛠 ({i}/{total}) در حال آماده‌سازی «{inner_label}»...")
                 inner = await asyncio.to_thread(archive.read, name)
                 if ikind == "pdf":
-                    data = inner
+                    data = ensure_valid_pdf(inner)
                 else:
                     data, _stats = await _run_heavy(_archive_to_pdf_with_stats, inner, ikind)
                 inner = None
@@ -69,10 +70,11 @@ async def try_handle(msg, context, status, raw, kind, orig_name, user_id):
                     continue
                 link = await upload_catbox_with_progress(f"{inner_label}.pdf", data, status, prefix=prefix)
                 await asyncio.sleep(3)  # فاصله بین آپلودها تا Catbox فایل خالی ذخیره نکنه
+                size = len(data)
                 data = None
                 if link:
                     bump_upload(user_id)
-                    results.append((inner_label, number, link, None))
+                    results.append((inner_label, number, link, None, size))
                 else:
                     results.append((inner_label, number, None, "آپلود به Catbox ناموفق بود"))
             except TaskCancelled:
