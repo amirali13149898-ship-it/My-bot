@@ -15,6 +15,7 @@ from core.telegram_io import (
 from core.users import bump_upload, is_admin, is_allowed, is_site_admin
 from handlers import site
 from handlers.bulk import _label_html
+from handlers.bulk_multi import try_handle as _try_multichapter
 from handlers.convert_flow import _convert_to_pdf_and_upload, _detect_convert_kind
 from handlers.locked import handle_locked_file
 from handlers.reply import process_and_reply
@@ -194,6 +195,13 @@ async def _handle_bulk_file(msg, context, user_id):
 
     note = ""
     if is_zip or is_rar:
+        # فایل چندچپتری (مثل 11-20.zip با چند ZIP/RAR/PDF داخلش) خودکار تشخیص داده و جدا میشه
+        await _safe_edit(status, f"🔍 در حال بررسی «{label}»...")
+        if await _try_multichapter(msg, context, status, file_bytes, "rar" if is_rar else "zip",
+                                   original_name, user_id):
+            file_bytes = None
+            gc.collect()
+            return
         await _safe_edit(status, f"🛠 در حال تبدیل «{label}» به PDF...")
         try:
             upload_bytes, stats = await _run_heavy(
