@@ -155,6 +155,7 @@ async def _process_entries(msg, context, session, status, archive, entries, oute
             data = None
             if not link:
                 raise RuntimeError("آپلود روی Catbox ناموفق بود")
+            await asyncio.sleep(3)  # فاصله بین آپلودها تا Catbox فایل خالی ذخیره نکنه
         except TaskCancelled:
             cancelled = True
             break
