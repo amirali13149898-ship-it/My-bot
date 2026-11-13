@@ -1,5 +1,4 @@
 """آپلودرها: Catbox / ImgBB / Imgur"""
-import hashlib
 import io
 import mimetypes
 import requests
@@ -46,40 +45,6 @@ def _catbox_post(filename, file_bytes, progress_cb):
     )
 
 
-def _verify_remote_size(link, data, tries=4):
-    """
-    بعد از آپلود، فایل رو واقعاً از Catbox دانلود می‌کنه و حجم + SHA-256 رو با فایل اصلی
-    مقایسه می‌کنه. (قبلاً فقط هدر Content-Length با HEAD چک میشد که کافی نبود:
-    Catbox زیر فشار گاهی لینک میده ولی فایل ۰ بایت یا ناقص ذخیره می‌کنه.)
-    True = سالمه، False = خرابه، None = نتونستیم چک کنیم (فقط خطای شبکه) -> قبول می‌کنیم.
-    """
-    expected = len(data)
-    want = hashlib.sha256(bytes(data)).hexdigest()
-    last = None
-    for i in range(tries):
-        try:
-            h = hashlib.sha256()
-            size = 0
-            with requests.get(link, stream=True, allow_redirects=True, timeout=60) as r:
-                if r.status_code == 200:
-                    for chunk in r.iter_content(1024 * 256):
-                        h.update(chunk)
-                        size += len(chunk)
-                    last = (size == expected and h.hexdigest() == want)
-                    if last:
-                        return True
-                else:
-                    last = None if r.status_code >= 500 else False
-        except Exception:
-            last = None
-        time.sleep(2 * (i + 1))
-    return last
-
-
-def file_bytes_view(data):
-    return memoryview(data) if not isinstance(data, memoryview) else data
-
-
 def upload_catbox(filename, file_bytes, progress_cb=None):
     """
     آپلود به Catbox. اگه progress_cb داده بشه، آپلود به‌صورت استریم (با
@@ -99,16 +64,7 @@ def upload_catbox(filename, file_bytes, progress_cb=None):
             r = _catbox_post(filename, file_bytes, progress_cb)
             text = (r.text or "").strip()
             if r.status_code == 200 and text.startswith("http"):
-                ok = _verify_remote_size(text, file_bytes)
-                print(f"🔎 Catbox verify {filename}: {len(file_bytes)} bytes -> {ok} ({text})")
-                if ok is not False:
-                    return text
-                print(f"⚠️ Catbox فایل ناقص/خالی ذخیره کرد ({filename}) -> آپلود دوباره")
-                reason = "فایل روی Catbox کامل ذخیره نشد"
-                time.sleep(wait)
-                if attempt < UPLOAD_RETRIES:
-                    continue
-                return None
+                return text
             reason = f"HTTP {r.status_code}: {text[:150]}"
             if r.status_code in (400, 401, 403, 413):
                 # خطای قطعیِ سمت درخواست - تکرارش فایده ای نداره
