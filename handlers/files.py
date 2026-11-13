@@ -15,7 +15,6 @@ from core.telegram_io import (
 from core.users import bump_upload, is_admin, is_allowed, is_site_admin
 from handlers import site
 from handlers.bulk import _label_html
-from handlers.split import handle_split_file
 from handlers.convert_flow import _convert_to_pdf_and_upload, _detect_convert_kind
 from handlers.locked import handle_locked_file
 from handlers.reply import process_and_reply
@@ -75,8 +74,6 @@ async def _handle_file_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_bulk_file(msg, context, user_id)
     elif mode == "locked":
         await handle_locked_file(msg, context)
-    elif mode == "split":
-        await handle_split_file(msg, context, user_id)
 
 
 # ==================== آپلود تکی (تشخیص خودکار نوع فایل) ====================
