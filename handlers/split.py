@@ -33,7 +33,7 @@ async def _send_doc(msg, data, filename, caption):
         try:
             await msg.reply_document(
                 document=io.BytesIO(data), filename=filename,
-                caption=caption,
+                caption=caption, parse_mode="HTML",
             )
             return
         except RetryAfter as e:
@@ -91,26 +91,17 @@ async def handle_split_file(msg, context, user_id):
             return
 
         total = len(entries)
-        used_names = {}
         for i, (name, ikind, number) in enumerate(entries, 1):
-            orig_base = os.path.basename(name) or f"part{i}"
-            ext = "pdf" if ikind == "pdf" else ikind
-            if number is not None:
-                base = f"Chapter {fmt_num(number)}"
-                if base in used_names:  # دو فایل با یه شماره
-                    used_names[base] += 1
-                    base = f"{base} ({used_names[base]})"
-                else:
-                    used_names[base] = 1
-                base = f"{base}.{ext}"
-            else:
-                base = f"{os.path.splitext(orig_base)[0]}.{ext}"  # شماره معلوم نیست: اسم اصلی
+            base = os.path.basename(name) or f"part{i}.{ikind}"
+            if ikind != "pdf" and not base.lower().endswith(_ARCHIVE_EXTS):
+                base = f"{os.path.splitext(base)[0]}.{ikind}"  # پسوند گم‌شده/غلط
             await _safe_edit(status, f"📤 ({i}/{total}) در حال ارسال «{base}»...")
             try:
                 data = await asyncio.to_thread(archive.read, name)
                 if not data:
                     raise RuntimeError("فایل خالی بود (موقع باز کردن آرشیو درست استخراج نشده)")
-                await _send_doc(msg, data, base, None)
+                head = f"📄 چپتر <code>{fmt_num(number)}</code>" if number is not None else "📄 ❓ شماره نامشخص"
+                await _send_doc(msg, data, base, f"{head}\n{html.escape(base)}")
                 sent.append((base, number))
                 await asyncio.sleep(1)
             except Exception as e:
@@ -128,7 +119,7 @@ async def handle_split_file(msg, context, user_id):
         if missing:
             lines.append("⚠️ از بازه‌ی اسم فایل این چپترها داخلش نبود: " + ", ".join(fmt_num(n) for n in missing))
     if any(n is None for _b, n in sent):
-        lines.append("❓ شماره‌ی بعضی چپترها از اسم فایلشون معلوم نشد؛ اسم اصلیشون رو نگه داشتم.")
+        lines.append("❓ شماره‌ی بعضی چپترها از اسم فایلشون معلوم نشد؛ اسم فایل زیر هر کدوم هست.")
     if failed:
         lines.append("❌ ارسال نشد:\n" + "\n".join(f"• {html.escape(f)}" for f in failed))
     try:
