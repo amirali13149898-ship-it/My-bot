@@ -1,8 +1,10 @@
 """نقطه‌ی ورود ربات"""
 import threading
 import time
+
+import requests
 from telegram import Update
-from telegram.error import RetryAfter
+from telegram.error import InvalidToken, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -91,6 +93,22 @@ def build_app():
     return app
 
 
+def _diagnose_token():
+    """وقتی تلگرام توکن رو رد کرد: همون توکن رو هم روی سرور محلی و هم روی api.telegram.org تست می‌کنه
+    و نتیجه رو (بدون چاپ توکن) توی لاگ میذاره تا معلوم بشه مشکل از توکنه یا از Local Bot API."""
+    tok = BOT_TOKEN or ""
+    print(f"🔎 طول توکن: {len(tok)} | فاصله/خط‌جدید اضافه: {tok != tok.strip()} | شامل کوتیشن: {any(c in tok for c in chr(34) + chr(39))}")
+    targets = [("cloud (api.telegram.org)", "https://api.telegram.org")]
+    if USE_LOCAL_BOT_API:
+        targets.insert(0, ("local Bot API", LOCAL_BOT_API_URL))
+    for name, base in targets:
+        try:
+            r = requests.get(f"{base}/bot{tok.strip()}/getMe", timeout=20)
+            print(f"🔎 getMe روی {name}: HTTP {r.status_code} {r.text[:160]}")
+        except Exception as e:
+            print(f"🔎 getMe روی {name} خطا داد: {type(e).__name__}: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده! یه Environment Variable به اسم BOT_TOKEN اضافه کن.")
@@ -118,11 +136,19 @@ def main():
 
     # اگه تلگرام همون اول (initialize/get_me/getUpdates) RetryAfter بده، قبلاً
     # بات کرش می‌کرد و رندر دائم ری‌استارتش می‌کرد. اینجا صبر می‌کنیم و دوباره امتحان می‌کنیم.
+    token_failures = 0
     while True:
         app = build_app()
         try:
             app.run_polling()
             break
+        except InvalidToken:
+            token_failures += 1
+            _diagnose_token()
+            if token_failures >= 3:
+                raise
+            print(f"⏳ توکن رد شد ({token_failures}/3)؛ ۲۰ ثانیه صبر و تلاش دوباره (شاید سرور محلی هنوز آماده نبوده)...")
+            time.sleep(20)
         except RetryAfter as e:
             _note_flood(e)
             wait = getattr(e, "retry_after", 30)
