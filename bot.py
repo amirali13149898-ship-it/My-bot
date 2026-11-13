@@ -1,5 +1,4 @@
 """نقطه‌ی ورود ربات"""
-import asyncio
 import threading
 import time
 
@@ -139,8 +138,6 @@ def main():
     # بات کرش می‌کرد و رندر دائم ری‌استارتش می‌کرد. اینجا صبر می‌کنیم و دوباره امتحان می‌کنیم.
     token_failures = 0
     while True:
-        # بعد از هر شکست run_polling حلقه‌ی رویداد بسته میشه؛ برای تلاش بعدی یکی تازه لازمه
-        asyncio.set_event_loop(asyncio.new_event_loop())
         app = build_app()
         try:
             app.run_polling()
